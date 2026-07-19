@@ -21,6 +21,10 @@ Exposes an HTTP server with endpoints:
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
+- PUT  /internal/session-files/{session_id}/{path} — write session scratch file (Hermes OS)
+- GET  /internal/session-files/{session_id} — list session scratch files
+- GET  /internal/session-files/{session_id}/{path} — read session scratch file
+- DELETE /internal/session-files/{session_id} — clear session scratch directory
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
 AnythingLLM, NextChat, ChatBox, etc.) can connect to hermes-agent
@@ -4881,11 +4885,16 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # Hermes OS: per-chat-session scratch under HERMES_SESSION_FILES_ROOT.
+            from gateway.platforms.session_files import register_session_file_routes
+
+            register_session_file_routes(self._app, self._check_auth)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
             # upstream session-control handlers.
             self._app["api_server_adapter"] = self
+
 
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())

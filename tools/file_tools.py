@@ -19,6 +19,7 @@ from tools.file_operations import (
 )
 from tools import file_state
 from agent.redact import redact_sensitive_text
+from tools.session_fs_guard import SessionFsJailError
 
 logger = logging.getLogger(__name__)
 
@@ -377,6 +378,7 @@ def _resolve_base_dir(
     """Return the ABSOLUTE base directory for resolving relative paths.
 
     Resolution order:
+      0. Hermes OS session scratch (when HERMES_SESSION_FILES_ROOT + session_id)
       1. The task's live terminal cwd (the directory the agent is actually
          working in — e.g. a git worktree). Authoritative when known.
       2. A registered task/session cwd override (TUI/Desktop/ACP sessions
@@ -396,6 +398,17 @@ def _resolve_base_dir(
     outright (rather than anchoring them to the process cwd) and fall through to
     the process cwd only as a last resort, deterministically.
     """
+    from tools.session_fs_guard import SessionFsJailError, active_session_root
+
+    try:
+        session_root = active_session_root()
+        if session_root is not None:
+            return session_root
+    except SessionFsJailError:
+        raise
+    except Exception:
+        pass
+
     root = _authoritative_workspace_root(task_id)
     if container_paths is None:
         container_paths = _uses_container_paths(task_id)
@@ -431,6 +444,7 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     """Resolve *filepath* against the task's absolute base directory.
 
     See :func:`_resolve_base_dir` for how the base is chosen. Absolute input
+<<<<<<< HEAD
     paths are returned resolved-but-unanchored.
 
     On native Windows, Git Bash / MSYS drive paths (``/c/Users/...``) are
@@ -458,6 +472,17 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
         return Path(ntpath.normpath(joined))
 
     p = Path(expanded)
+=======
+    paths are returned resolved-but-unanchored — except in Hermes OS session
+    mode, where all paths are jails under the session scratch directory.
+    """
+    from tools.session_fs_guard import SessionFsJailError, hermes_os_session_mode, jail_path
+
+    if hermes_os_session_mode():
+        return jail_path(filepath, expand_tilde=_expand_tilde)
+
+    p = Path(_expand_tilde(filepath))
+>>>>>>> 1c6e960b0 (feat(files): session scratch endpoints and native file-tool jail)
     if p.is_absolute():
         return p.resolve()
     resolved = _resolve_base_dir(task_id, container_paths=False) / p
@@ -663,8 +688,30 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     """Return an error message if the path targets a sensitive system location."""
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
+    except SessionFsJailError:
+        # Jail denial is handled by the tool caller; not a "sensitive path" hit.
+        return None
     except (OSError, ValueError):
         resolved = filepath
+
+    # Hermes OS session scratch lives under /tmp (often /private/var/folders on
+    # macOS host tests). That must not trip the /private/var/ system-path block.
+    try:
+        from tools.session_fs_guard import active_session_root, hermes_os_session_mode
+
+        if hermes_os_session_mode():
+            session_root = active_session_root()
+            if session_root is not None:
+                try:
+                    Path(resolved).resolve().relative_to(session_root)
+                    return None
+                except (ValueError, OSError):
+                    pass
+    except SessionFsJailError:
+        return None
+    except Exception:
+        pass
+
     normalized = os.path.normpath(_expand_tilde(filepath))
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
@@ -1362,9 +1409,14 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
+        # Pass the jail-/cwd-resolved ABSOLUTE path to the shell layer.
+        # Relative paths would be re-resolved against the terminal env cwd
+        # (often /opt/data), which disagrees with Hermes OS session scratch
+        # under HERMES_SESSION_FILES_ROOT/{session_id}/.
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        result = file_ops.read_file(resolved_str, offset, limit)
         result_dict = result.to_dict()
+        result_dict["resolved_path"] = resolved_str
 
         # ── Character-count guard ─────────────────────────────────────
         # We're model-agnostic so we can't count tokens; characters are
@@ -1694,6 +1746,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # check below still runs.
         try:
             _resolved = str(_resolve_path_for_task(path, task_id))
+        except SessionFsJailError:
+            raise
         except Exception:
             _resolved = None
 
@@ -1983,6 +2037,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "already_searched": count,
             }, ensure_ascii=False)
 
+<<<<<<< HEAD
         try:
             resolved_path = _resolve_path_for_task(path, task_id)
         except (OSError, ValueError, RuntimeError):
@@ -1990,10 +2045,21 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
             return json.dumps({"error": block_error}, ensure_ascii=False)
+=======
+        # Resolve search root the same way as read/write so Hermes OS session
+        # jails apply (relative "." must mean the session scratch dir, not
+        # /opt/data).
+        try:
+            search_path = str(_resolve_path_for_task(path or ".", task_id))
+        except SessionFsJailError:
+            raise
+        except Exception:
+            search_path = path
+>>>>>>> 1c6e960b0 (feat(files): session scratch endpoints and native file-tool jail)
 
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
+            pattern=pattern, path=search_path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
         )
         omitted = _filter_read_blocked_search_results(result, task_id)
@@ -2143,11 +2209,26 @@ SEARCH_FILES_SCHEMA = {
 
 
 def _handle_read_file(args, **kw):
+    from tools.session_fs_guard import reset_session_id, set_session_id
+
     tid = kw.get("task_id") or "default"
-    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+    token = set_session_id(kw.get("session_id"))
+    try:
+        return read_file_tool(
+            path=args.get("path", ""),
+            offset=args.get("offset", 1),
+            limit=args.get("limit", 500),
+            task_id=tid,
+        )
+    except SessionFsJailError as exc:
+        return tool_error(str(exc))
+    finally:
+        reset_session_id(token)
 
 
 def _handle_write_file(args, **kw):
+    from tools.session_fs_guard import reset_session_id, set_session_id
+
     tid = kw.get("task_id") or "default"
     if not args.get("path") or not isinstance(args.get("path"), str):
         return tool_error(
@@ -2167,15 +2248,31 @@ def _handle_write_file(args, **kw):
             f"write_file: 'content' must be a string, got "
             f"{type(args['content']).__name__}."
         )
+<<<<<<< HEAD
     return write_file_tool(
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
         session_id=kw.get("session_id"),
     )
+=======
+    token = set_session_id(kw.get("session_id"))
+    try:
+        return write_file_tool(
+            path=args["path"], content=args["content"], task_id=tid,
+            cross_profile=bool(args.get("cross_profile", False)),
+        )
+    except SessionFsJailError as exc:
+        return tool_error(str(exc))
+    finally:
+        reset_session_id(token)
+>>>>>>> 1c6e960b0 (feat(files): session scratch endpoints and native file-tool jail)
 
 
 def _handle_patch(args, **kw):
+    from tools.session_fs_guard import reset_session_id, set_session_id
+
     tid = kw.get("task_id") or "default"
+<<<<<<< HEAD
     return patch_tool(
         mode=args.get("mode", "replace"), path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),
@@ -2183,17 +2280,43 @@ def _handle_patch(args, **kw):
         cross_profile=bool(args.get("cross_profile", False)),
         session_id=kw.get("session_id"),
     )
+=======
+    token = set_session_id(kw.get("session_id"))
+    try:
+        return patch_tool(
+            mode=args.get("mode", "replace"), path=args.get("path"),
+            old_string=args.get("old_string"), new_string=args.get("new_string"),
+            replace_all=args.get("replace_all", False), patch=args.get("patch"),
+            task_id=tid,
+            cross_profile=bool(args.get("cross_profile", False)),
+        )
+    except SessionFsJailError as exc:
+        return tool_error(str(exc))
+    finally:
+        reset_session_id(token)
+>>>>>>> 1c6e960b0 (feat(files): session scratch endpoints and native file-tool jail)
 
 
 def _handle_search_files(args, **kw):
+    from tools.session_fs_guard import reset_session_id, set_session_id
+
     tid = kw.get("task_id") or "default"
     target_map = {"grep": "content", "find": "files"}
     raw_target = args.get("target", "content")
     target = target_map.get(raw_target, raw_target)
-    return search_tool(
-        pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
-        file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
-        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
+    token = set_session_id(kw.get("session_id"))
+    try:
+        return search_tool(
+            pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
+            file_glob=args.get("file_glob"), limit=args.get("limit", 50),
+            offset=args.get("offset", 0),
+            output_mode=args.get("output_mode", "content"),
+            context=args.get("context", 0), task_id=tid,
+        )
+    except SessionFsJailError as exc:
+        return tool_error(str(exc))
+    finally:
+        reset_session_id(token)
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
