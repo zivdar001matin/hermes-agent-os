@@ -175,3 +175,62 @@ def test_handler_passes_session_id(session_env):
     data = json.loads(out)
     assert not data.get("error"), data
     assert (session_env / "chat-handler" / "via-handler.txt").read_text() == "ok"
+
+
+def test_widget_py_allowed_when_scratch_inside_safe_root(tmp_path, monkeypatch):
+    """Scratch nested under HERMES_WRITE_SAFE_ROOT (/opt/data/temp/sessions) is writable.
+
+    Mirrors the container layout: HERMES_HOME=HERMES_WRITE_SAFE_ROOT=/opt/data and
+    session scratch lives under /opt/data/temp/sessions/{session_id}/.
+    """
+    import tools.file_tools as ft
+
+    safe_root = tmp_path / "opt" / "data"
+    scratch_root = safe_root / "temp" / "sessions"
+    scratch_root.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(safe_root))
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(safe_root))
+    monkeypatch.setenv("HERMES_SESSION_FILES_ROOT", str(scratch_root))
+
+    token = _with_session("api_1784626892_3e471d93")
+    try:
+        result = json.loads(
+            ft._handle_write_file(
+                {"path": "widget.py", "content": "class Widget: pass\n"},
+                task_id="default",
+                session_id="api_1784626892_3e471d93",
+            )
+        )
+        assert not result.get("error"), result
+        dest = scratch_root / "api_1784626892_3e471d93" / "widget.py"
+        assert dest.is_file()
+        assert "class Widget" in dest.read_text()
+    finally:
+        reset_session_id(token)
+
+
+def test_opt_data_root_still_blocked_in_session_mode(tmp_path, monkeypatch):
+    """A bare /opt/data write (outside the session scratch subtree) stays jailed."""
+    import tools.file_tools as ft
+
+    safe_root = tmp_path / "opt" / "data"
+    scratch_root = safe_root / "temp" / "sessions"
+    scratch_root.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(safe_root))
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(safe_root))
+    monkeypatch.setenv("HERMES_SESSION_FILES_ROOT", str(scratch_root))
+
+    token = _with_session("chat-1")
+    try:
+        result = json.loads(
+            ft._handle_write_file(
+                {"path": str(safe_root / "widget.py"), "content": "nope"},
+                task_id="default",
+                session_id="chat-1",
+            )
+        )
+        assert "error" in result
+        assert "outside the session directory" in result["error"]
+        assert not (safe_root / "widget.py").exists()
+    finally:
+        reset_session_id(token)

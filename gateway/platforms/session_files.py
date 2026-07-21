@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover
     web = None  # type: ignore[assignment]
 
 
-DEFAULT_SESSION_FILES_ROOT = "/tmp/sessions"
+DEFAULT_SESSION_FILES_ROOT = "/opt/data/temp/sessions"
 DEFAULT_MAX_FILE_BYTES = 10_000_000  # align with api_server MAX_REQUEST_BYTES
 DEFAULT_MAX_SESSION_BYTES = 200_000_000
 
