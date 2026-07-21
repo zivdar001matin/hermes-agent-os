@@ -444,13 +444,18 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     """Resolve *filepath* against the task's absolute base directory.
 
     See :func:`_resolve_base_dir` for how the base is chosen. Absolute input
-<<<<<<< HEAD
-    paths are returned resolved-but-unanchored.
+    paths are returned resolved-but-unanchored — except in Hermes OS session
+    mode, where all paths are jails under the session scratch directory.
 
     On native Windows, Git Bash / MSYS drive paths (``/c/Users/...``) are
     translated to ``C:\\Users\\...`` before resolution so file tools don't
     treat them as relative ``\\c\\Users\\...`` under the process cwd.
     """
+    from tools.session_fs_guard import hermes_os_session_mode, jail_path
+
+    if hermes_os_session_mode():
+        return jail_path(filepath, expand_tilde=_expand_tilde)
+
     container_paths = _uses_container_paths(task_id)
     if container_paths:
         expanded = _expand_tilde(filepath)
@@ -472,17 +477,6 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
         return Path(ntpath.normpath(joined))
 
     p = Path(expanded)
-=======
-    paths are returned resolved-but-unanchored — except in Hermes OS session
-    mode, where all paths are jails under the session scratch directory.
-    """
-    from tools.session_fs_guard import SessionFsJailError, hermes_os_session_mode, jail_path
-
-    if hermes_os_session_mode():
-        return jail_path(filepath, expand_tilde=_expand_tilde)
-
-    p = Path(_expand_tilde(filepath))
->>>>>>> 1c6e960b0 (feat(files): session scratch endpoints and native file-tool jail)
     if p.is_absolute():
         return p.resolve()
     resolved = _resolve_base_dir(task_id, container_paths=False) / p
@@ -2037,25 +2031,20 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "already_searched": count,
             }, ensure_ascii=False)
 
-<<<<<<< HEAD
-        try:
-            resolved_path = _resolve_path_for_task(path, task_id)
-        except (OSError, ValueError, RuntimeError):
-            resolved_path = None
-        block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
-        if block_error:
-            return json.dumps({"error": block_error}, ensure_ascii=False)
-=======
         # Resolve search root the same way as read/write so Hermes OS session
         # jails apply (relative "." must mean the session scratch dir, not
         # /opt/data).
         try:
-            search_path = str(_resolve_path_for_task(path or ".", task_id))
+            resolved_path = _resolve_path_for_task(path or ".", task_id)
+            search_path = str(resolved_path)
         except SessionFsJailError:
             raise
-        except Exception:
+        except (OSError, ValueError, RuntimeError, Exception):
+            resolved_path = None
             search_path = path
->>>>>>> 1c6e960b0 (feat(files): session scratch endpoints and native file-tool jail)
+        block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
+        if block_error:
+            return json.dumps({"error": block_error}, ensure_ascii=False)
 
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
@@ -2248,39 +2237,23 @@ def _handle_write_file(args, **kw):
             f"write_file: 'content' must be a string, got "
             f"{type(args['content']).__name__}."
         )
-<<<<<<< HEAD
-    return write_file_tool(
-        path=args["path"], content=args["content"], task_id=tid,
-        cross_profile=bool(args.get("cross_profile", False)),
-        session_id=kw.get("session_id"),
-    )
-=======
     token = set_session_id(kw.get("session_id"))
     try:
         return write_file_tool(
             path=args["path"], content=args["content"], task_id=tid,
             cross_profile=bool(args.get("cross_profile", False)),
+            session_id=kw.get("session_id"),
         )
     except SessionFsJailError as exc:
         return tool_error(str(exc))
     finally:
         reset_session_id(token)
->>>>>>> 1c6e960b0 (feat(files): session scratch endpoints and native file-tool jail)
 
 
 def _handle_patch(args, **kw):
     from tools.session_fs_guard import reset_session_id, set_session_id
 
     tid = kw.get("task_id") or "default"
-<<<<<<< HEAD
-    return patch_tool(
-        mode=args.get("mode", "replace"), path=args.get("path"),
-        old_string=args.get("old_string"), new_string=args.get("new_string"),
-        replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
-        cross_profile=bool(args.get("cross_profile", False)),
-        session_id=kw.get("session_id"),
-    )
-=======
     token = set_session_id(kw.get("session_id"))
     try:
         return patch_tool(
@@ -2289,12 +2262,13 @@ def _handle_patch(args, **kw):
             replace_all=args.get("replace_all", False), patch=args.get("patch"),
             task_id=tid,
             cross_profile=bool(args.get("cross_profile", False)),
+            session_id=kw.get("session_id"),
         )
     except SessionFsJailError as exc:
         return tool_error(str(exc))
     finally:
         reset_session_id(token)
->>>>>>> 1c6e960b0 (feat(files): session scratch endpoints and native file-tool jail)
+
 
 
 def _handle_search_files(args, **kw):
