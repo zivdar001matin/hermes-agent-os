@@ -1530,6 +1530,100 @@ def _normalize_media_tag_path(raw: str) -> str:
     return path.lstrip("`\"'").rstrip("`\"',.;:)}]")
 
 
+# Basename-only MEDIA tags (no leading / or ~/) — common model mistake when
+# Hermes OS stages attachments as flat filenames. Rewritten to absolute
+# session-scratch paths before extract_media when the file exists uniquely.
+MEDIA_BASENAME_TAG_RE = re.compile(
+    r'''(?P<prefix>[`"']?MEDIA:\s*)'''
+    r'''(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|'''
+    r'''(?!(?:~/|/|[A-Za-z]:[/\\]))'''
+    r'''(?P<name>[A-Za-z0-9][A-Za-z0-9._-]{0,255}\.(?:'''
+    + _MEDIA_EXT_ALTERNATION
+    + r''')))'''
+    r'''(?P<suffix>[`"']?)''',
+    re.IGNORECASE,
+)
+
+
+def session_files_root_for_media() -> Path:
+    raw = os.environ.get("HERMES_SESSION_FILES_ROOT") or "/opt/data/temp/sessions"
+    return Path(raw).expanduser()
+
+
+def resolve_session_scratch_file(
+    filename: str,
+    *,
+    session_id: Optional[str] = None,
+    root: Optional[Path] = None,
+) -> Optional[str]:
+    """Return absolute path to ``filename`` under session scratch, or None.
+
+    Prefer ``root/session_id/filename`` when ``session_id`` is set and the file
+    exists. Otherwise, if exactly one match exists under any session directory,
+    return that path. Ambiguous / missing → None.
+    """
+    raw = str(filename or "").strip()
+    path = Path(raw)
+    if len(path.parts) != 1:
+        return None
+    name = path.name
+    if not name or name in (".", ".."):
+        return None
+    base = (root or session_files_root_for_media()).expanduser()
+    if session_id:
+        sid = str(session_id).strip()
+        if sid and ".." not in sid and "/" not in sid and "\\" not in sid:
+            candidate = (base / sid / name).resolve()
+            try:
+                candidate.relative_to(base.resolve())
+            except ValueError:
+                return None
+            if candidate.is_file():
+                return str(candidate)
+
+    if not base.is_dir():
+        return None
+    matches: list[Path] = []
+    try:
+        for session_dir in base.iterdir():
+            if not session_dir.is_dir():
+                continue
+            candidate = session_dir / name
+            if candidate.is_file():
+                matches.append(candidate.resolve())
+    except OSError:
+        return None
+    if len(matches) == 1:
+        return str(matches[0])
+    return None
+
+
+def rewrite_session_media_basenames(
+    content: str,
+    *,
+    session_id: Optional[str] = None,
+    root: Optional[Path] = None,
+) -> str:
+    """Rewrite ``MEDIA:basename.ext`` to absolute session-scratch paths.
+
+    Absolute / home-relative ``MEDIA:`` tags are left unchanged. Basename tags
+    rewrite only when ``resolve_session_scratch_file`` finds a unique file.
+    """
+    if not content or "MEDIA:" not in content:
+        return content
+
+    def _replace(match: re.Match) -> str:
+        name = _normalize_media_tag_path(match.group("name") or match.group("path"))
+        resolved = resolve_session_scratch_file(
+            name, session_id=session_id, root=root
+        )
+        if not resolved:
+            return match.group(0)
+        return f"{match.group('prefix')}{resolved}{match.group('suffix') or ''}"
+
+    return MEDIA_BASENAME_TAG_RE.sub(_replace, content)
+
+
 def _path_lacks_deliverable_extension(path: str) -> bool:
     """True when MEDIA_TAG_CLEANUP_RE's extension alternation does not cover
     ``path`` — either the basename has no extension at all (Caddyfile,
@@ -5077,6 +5171,15 @@ class BasePlatformAdapter(ABC):
 
                 # Pre-extract snapshot for the #29346 recovery/invariant below.
                 _response_pre_extract = response
+
+                # Rewrite MEDIA:basename.ext → absolute session-scratch paths
+                # when a unique file exists (Hermes OS chat attachments).
+                _sid = getattr(event, "session_id", None) or getattr(
+                    getattr(event, "source", None), "session_id", None
+                )
+                response = rewrite_session_media_basenames(
+                    response, session_id=_sid if isinstance(_sid, str) else None
+                )
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)

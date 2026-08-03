@@ -217,6 +217,7 @@ try:
         CommandHandler,
         CallbackQueryHandler,
         MessageHandler as TelegramMessageHandler,
+        TypeHandler,
         ContextTypes,
         filters,
     )
@@ -235,6 +236,7 @@ except ImportError:
     CommandHandler = Any
     CallbackQueryHandler = Any
     TelegramMessageHandler = Any
+    TypeHandler = Any
     HTTPXRequest = Any
     filters = None
     ParseMode = None
@@ -374,7 +376,7 @@ def check_telegram_requirements() -> bool:
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
     global InlineKeyboardMarkup, LinkPreviewOptions, Application
-    global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
+    global CommandHandler, CallbackQueryHandler, TelegramMessageHandler, TypeHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
         return True
@@ -394,6 +396,7 @@ def check_telegram_requirements() -> bool:
             Application as _App, CommandHandler as _CH,
             CallbackQueryHandler as _CQH,
             MessageHandler as _MH,
+            TypeHandler as _TH,
             ContextTypes as _CT, filters as _filters,
         )
         from telegram.constants import ParseMode as _PM, ChatType as _CtT
@@ -410,6 +413,7 @@ def check_telegram_requirements() -> bool:
     CommandHandler = _CH
     CallbackQueryHandler = _CQH
     TelegramMessageHandler = _MH
+    TypeHandler = _TH
     ContextTypes = _CT
     filters = _filters
     ParseMode = _PM
@@ -3590,6 +3594,16 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app = builder.build()
             self._bot = self._app.bot
             
+            # Persist every Bot API update to Hermes OS (Postgres) before
+            # gating/dispatch. group=-1 runs first; block=False keeps intake fast.
+            self._app.add_handler(
+                TypeHandler(
+                    Update,
+                    self._persist_incoming_update_to_hermesos,
+                    block=False,
+                ),
+                group=-1,
+            )
             # Register handlers
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
@@ -8125,6 +8139,25 @@ class TelegramAdapter(BasePlatformAdapter):
         consuming channel posts without ever building a gateway event.
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
+
+    async def _persist_incoming_update_to_hermesos(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Fire-and-forget persist of every Bot API update to Hermes OS."""
+        try:
+            from plugins.platforms.telegram.hermesos_persist import (
+                schedule_hermesos_inbound_persist,
+            )
+
+            schedule_hermesos_inbound_persist(update)
+        except Exception:
+            logger.debug(
+                "[%s] Hermes OS inbound persist schedule failed",
+                getattr(self, "name", "telegram"),
+                exc_info=True,
+            )
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
