@@ -67,6 +67,22 @@ MAX_MESSAGE_LENGTH = 50_000
 SMTP_CONNECT_TIMEOUT = 30
 
 
+def _email_ssl_context() -> ssl.SSLContext:
+    """TLS context for IMAP/SMTP. ``EMAIL_INSECURE_SSL`` skips verify (dev mail)."""
+    ctx = ssl.create_default_context()
+    if env_bool("EMAIL_INSECURE_SSL", False):
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _imap_ssl_connect(host: str, port: int, *, timeout: float = 30) -> "imaplib.IMAP4":
+    """Open an IMAPS connection with the shared SSL context."""
+    return imaplib.IMAP4_SSL(
+        host, port, timeout=timeout, ssl_context=_email_ssl_context()
+    )
+
+
 def _create_ipv4_connection(
     host: str,
     port: int,
@@ -509,8 +525,8 @@ class EmailAdapter(BasePlatformAdapter):
     def _connect_smtp(self) -> smtplib.SMTP:
         """Create an SMTP connection, selecting the correct protocol for the port.
 
-        Port 465 uses implicit TLS (``SMTP_SSL``).  All other ports use
-        ``SMTP`` + ``STARTTLS``.
+        Port 465 (and GreenMail SMTPS 3465) use implicit TLS (``SMTP_SSL``).
+        All other ports use ``SMTP`` + ``STARTTLS``.
 
         When the host resolves to an IPv6 address that is unreachable
         (common on networks without IPv6 routing), the default connection can
@@ -521,7 +537,7 @@ class EmailAdapter(BasePlatformAdapter):
         Returns a connected SMTP object with TLS established — callers
         can proceed directly to ``login()``.
         """
-        ctx = ssl.create_default_context()
+        ctx = _email_ssl_context()
         host = self._smtp_host
         port = self._smtp_port
 
@@ -529,7 +545,7 @@ class EmailAdapter(BasePlatformAdapter):
             """Attempt one SMTP connection."""
             smtp_cls = _IPv4SMTP if ipv4_only else smtplib.SMTP
             smtp_ssl_cls = _IPv4SMTP_SSL if ipv4_only else smtplib.SMTP_SSL
-            if port == 465:
+            if port in (465, 3465):
                 return smtp_ssl_cls(host, port, timeout=SMTP_CONNECT_TIMEOUT, context=ctx)
             smtp = smtp_cls(host, port, timeout=SMTP_CONNECT_TIMEOUT)
             try:
@@ -582,7 +598,7 @@ class EmailAdapter(BasePlatformAdapter):
 
         try:
             # Test IMAP connection
-            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+            imap = _imap_ssl_connect(self._imap_host, self._imap_port, timeout=30)
             imap.login(self._address, self._password)
             _send_imap_id(imap)
             # Mark all existing messages as seen so we only process new ones
@@ -651,7 +667,7 @@ class EmailAdapter(BasePlatformAdapter):
         """Fetch new (unseen) messages from IMAP. Runs in executor thread."""
         results = []
         try:
-            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+            imap = _imap_ssl_connect(self._imap_host, self._imap_port, timeout=30)
             try:
                 imap.login(self._address, self._password)
                 _send_imap_id(imap)
