@@ -67,6 +67,16 @@ MAX_MESSAGE_LENGTH = 50_000
 SMTP_CONNECT_TIMEOUT = 30
 
 
+def _is_smtp_timeout_error(exc: BaseException) -> bool:
+    """True when SMTP connect/login failed due to a timeout (not auth/TLS)."""
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    # smtplib often wraps timeouts as SMTPServerDisconnected / OSError with
+    # "timed out" in the message (seen with GreenMail / unreachable hosts).
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text
+
+
 def _email_ssl_context() -> ssl.SSLContext:
     """TLS context for IMAP/SMTP. ``EMAIL_INSECURE_SSL`` skips verify (dev mail)."""
     ctx = ssl.create_default_context()
@@ -596,6 +606,21 @@ class EmailAdapter(BasePlatformAdapter):
             )
             return False
 
+        def _abort_connect(code: str, message: str) -> bool:
+            self._set_fatal_error(code, message, retryable=False)
+            try:
+                from plugins.platforms.email.hermesos_logout import (
+                    schedule_hermesos_email_smtp_logout,
+                )
+
+                schedule_hermesos_email_smtp_logout(message)
+            except Exception:
+                logger.debug(
+                    "[Email] Hermes OS email logout notify failed",
+                    exc_info=True,
+                )
+            return False
+
         try:
             # Test IMAP connection
             imap = _imap_ssl_connect(self._imap_host, self._imap_port, timeout=30)
@@ -613,7 +638,12 @@ class EmailAdapter(BasePlatformAdapter):
             logger.info("[Email] IMAP connection test passed. %d existing messages skipped.", len(self._seen_uids))
         except Exception as e:
             logger.error("[Email] IMAP connection failed: %s", e)
-            return False
+            # Any IMAP handshake failure (auth, TLS, timeout, unreachable host)
+            # logs the integration out in Hermes OS instead of retrying forever.
+            return _abort_connect(
+                "email_imap_connect_failed",
+                f"IMAP connection failed: {e}",
+            )
 
         try:
             # Test SMTP connection
@@ -625,7 +655,13 @@ class EmailAdapter(BasePlatformAdapter):
             logger.info("[Email] SMTP connection test passed.")
         except Exception as e:
             logger.error("[Email] SMTP connection failed: %s", e)
-            return False
+            # Same policy as IMAP: connect-time SMTP failure → disconnect in Settings.
+            code = (
+                "email_smtp_timeout"
+                if _is_smtp_timeout_error(e)
+                else "email_smtp_connect_failed"
+            )
+            return _abort_connect(code, f"SMTP connection failed: {e}")
 
         self._running = True
         self._poll_task = asyncio.create_task(self._poll_loop())

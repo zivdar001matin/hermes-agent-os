@@ -1020,13 +1020,20 @@ class TestConnectDisconnect(unittest.TestCase):
         import asyncio
         adapter = self._make_adapter()
 
-        with patch("imaplib.IMAP4_SSL", side_effect=Exception("IMAP down")):
+        with patch("imaplib.IMAP4_SSL", side_effect=Exception("IMAP down")), \
+             patch(
+                 "plugins.platforms.email.hermesos_logout.schedule_hermesos_email_smtp_logout"
+             ) as mock_logout:
             result = asyncio.run(adapter.connect())
             self.assertFalse(result)
             self.assertFalse(adapter._running)
+            self.assertTrue(adapter.has_fatal_error)
+            self.assertEqual(adapter.fatal_error_code, "email_imap_connect_failed")
+            self.assertFalse(adapter.fatal_error_retryable)
+            mock_logout.assert_called_once()
 
     def test_connect_smtp_failure(self):
-        """SMTP connection failure returns False."""
+        """SMTP connection failure returns False and logs out in Hermes OS."""
         import asyncio
         adapter = self._make_adapter()
 
@@ -1034,9 +1041,58 @@ class TestConnectDisconnect(unittest.TestCase):
         mock_imap.uid.return_value = ("OK", [b""])
 
         with patch("imaplib.IMAP4_SSL", return_value=mock_imap), \
-             patch("smtplib.SMTP", side_effect=Exception("SMTP down")):
+             patch("smtplib.SMTP", side_effect=Exception("SMTP down")), \
+             patch(
+                 "plugins.platforms.email.hermesos_logout.schedule_hermesos_email_smtp_logout"
+             ) as mock_logout:
             result = asyncio.run(adapter.connect())
             self.assertFalse(result)
+            self.assertTrue(adapter.has_fatal_error)
+            self.assertEqual(adapter.fatal_error_code, "email_smtp_connect_failed")
+            self.assertFalse(adapter.fatal_error_retryable)
+            mock_logout.assert_called_once()
+
+    def test_connect_smtp_timeout_sets_non_retryable_fatal(self):
+        """SMTP timeouts mark the adapter fatal so the gateway stops retrying."""
+        import asyncio
+        adapter = self._make_adapter()
+
+        mock_imap = MagicMock()
+        mock_imap.uid.return_value = ("OK", [b""])
+
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap), \
+             patch(
+                 "smtplib.SMTP",
+                 side_effect=TimeoutError("Connection unexpectedly closed: timed out"),
+             ), \
+             patch(
+                 "plugins.platforms.email.hermesos_logout.schedule_hermesos_email_smtp_logout"
+             ) as mock_logout:
+            result = asyncio.run(adapter.connect())
+            self.assertFalse(result)
+            self.assertTrue(adapter.has_fatal_error)
+            self.assertEqual(adapter.fatal_error_code, "email_smtp_timeout")
+            self.assertFalse(adapter.fatal_error_retryable)
+            mock_logout.assert_called_once()
+
+    def test_connect_imap_ssl_failure_sets_non_retryable_fatal(self):
+        """IMAP TLS failures also stop reconnect loops and notify Hermes OS."""
+        import asyncio
+        import ssl
+        adapter = self._make_adapter()
+
+        with patch(
+            "imaplib.IMAP4_SSL",
+            side_effect=ssl.SSLError("certificate verify failed: self-signed certificate"),
+        ), patch(
+            "plugins.platforms.email.hermesos_logout.schedule_hermesos_email_smtp_logout"
+        ) as mock_logout:
+            result = asyncio.run(adapter.connect())
+            self.assertFalse(result)
+            self.assertTrue(adapter.has_fatal_error)
+            self.assertEqual(adapter.fatal_error_code, "email_imap_connect_failed")
+            self.assertFalse(adapter.fatal_error_retryable)
+            mock_logout.assert_called_once()
 
     def test_disconnect_cancels_poll(self):
         """disconnect() should cancel the polling task."""
