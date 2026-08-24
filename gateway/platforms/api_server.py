@@ -400,6 +400,23 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
         return None, _multimodal_validation_error(exc, param=param)
 
 
+def _text_for_auto_title(content: Any) -> str:
+    """Flatten session-chat message content to plain text for title generation."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str) and part.strip():
+                parts.append(part.strip())
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+        return "\n".join(parts).strip()
+    return ""
+
+
 def check_api_server_requirements() -> bool:
     """Check if API server dependencies are available."""
     return AIOHTTP_AVAILABLE
@@ -1672,6 +1689,44 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
 
+    def _maybe_auto_title_session(
+        self,
+        *,
+        session_id: str,
+        user_message: Any,
+        final_response: str,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Fire Hermes auto-title after the first API session exchange (non-blocking)."""
+        user_text = _text_for_auto_title(user_message)
+        assistant_text = (final_response or "").strip()
+        if not session_id or not user_text or not assistant_text:
+            return
+        try:
+            from agent.title_generator import maybe_auto_title
+
+            db = self._ensure_session_db()
+            if db is None:
+                return
+
+            def _title_failure_cb(task: str, exc: BaseException) -> None:
+                logger.debug(
+                    "API server auto-title failure suppressed: %s: %s",
+                    task,
+                    exc,
+                )
+
+            maybe_auto_title(
+                db,
+                session_id,
+                user_text,
+                assistant_text,
+                conversation_history or [],
+                failure_callback=_title_failure_cb,
+            )
+        except Exception:
+            logger.debug("API server auto-title setup failed", exc_info=True)
+
     # ------------------------------------------------------------------
     # Agent creation helper
     # ------------------------------------------------------------------
@@ -2501,6 +2556,12 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        self._maybe_auto_title_session(
+            session_id=effective_session_id or session_id,
+            user_message=user_message,
+            final_response=final_response,
+            conversation_history=history,
+        )
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -2590,6 +2651,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
+                self._maybe_auto_title_session(
+                    session_id=effective_session_id or session_id,
+                    user_message=user_message,
+                    final_response=final_response,
+                    conversation_history=history,
+                )
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id,
