@@ -3373,11 +3373,11 @@ class TestSanitizeTitle:
         assert SessionDB.sanitize_title("\x00\x01\x02\u200b\ufeff") is None
 
     def test_max_length_allowed(self):
-        title = "A" * 100
+        title = "A" * SessionDB.MAX_TITLE_LENGTH
         assert SessionDB.sanitize_title(title) == title
 
     def test_exceeds_max_length_raises(self):
-        title = "A" * 101
+        title = "A" * (SessionDB.MAX_TITLE_LENGTH + 1)
         with pytest.raises(ValueError, match="too long"):
             SessionDB.sanitize_title(title)
 
@@ -3404,7 +3404,7 @@ class TestSanitizeTitle:
         """set_session_title raises ValueError for overly long titles."""
         db.create_session("s1", "cli")
         with pytest.raises(ValueError, match="too long"):
-            db.set_session_title("s1", "X" * 150)
+            db.set_session_title("s1", "X" * (SessionDB.MAX_TITLE_LENGTH + 1))
 
 
 class TestSchemaInit:

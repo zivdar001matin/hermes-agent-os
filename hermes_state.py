@@ -3284,8 +3284,9 @@ class SessionDB:
             return matches[0]
         return None
 
-    # Maximum length for session titles
-    MAX_TITLE_LENGTH = 100
+    # Maximum length for session titles (raised from 100 so mission/widget
+    # session titles with UUID suffixes can keep a readable name).
+    MAX_TITLE_LENGTH = 200
 
     @staticmethod
     def sanitize_title(title: Optional[str]) -> Optional[str]:

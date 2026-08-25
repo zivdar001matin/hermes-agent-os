@@ -135,7 +135,7 @@ class TestHandleTitleCommand:
         db.create_session("test_session_123", "telegram")
 
         runner = _make_runner(session_db=db)
-        long_title = "A" * 150
+        long_title = "A" * (SessionDB.MAX_TITLE_LENGTH + 1)
         event = _make_event(text=f"/title {long_title}")
         result = await runner._handle_title_command(event)
         assert "too long" in result
