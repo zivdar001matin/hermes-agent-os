@@ -1736,7 +1736,7 @@ def run_conversation(
                         }
                     
                     # Backoff before retry — jittered exponential: 5s base, 120s cap
-                    wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+                    wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=45.0)
                     agent._buffer_vprint(f"⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...")
                     logger.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
                     

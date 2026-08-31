@@ -37,7 +37,7 @@ def jittered_backoff(
     attempt: int,
     *,
     base_delay: float = 5.0,
-    max_delay: float = 120.0,
+    max_delay: float = 45.0,
     jitter_ratio: float = 0.5,
 ) -> float:
     """Compute a jittered exponential backoff delay.
@@ -45,7 +45,8 @@ def jittered_backoff(
     Args:
         attempt: 1-based retry attempt number.
         base_delay: Base delay in seconds for attempt 1.
-        max_delay: Maximum delay cap in seconds.
+        max_delay: Maximum delay cap in seconds (default 45s so interactive
+            retries recover without long dead time between attempts).
         jitter_ratio: Fraction of computed delay to use as random jitter
             range.  0.5 means jitter is uniform in [0, 0.5 * delay].
 
