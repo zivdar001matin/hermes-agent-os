@@ -1254,6 +1254,7 @@ def parse_context_limit_from_error(error_msg: str) -> Optional[int]:
         r'(\d{4,})\s*(?:token)?\s*(?:context|limit)',
         r'>\s*(\d{4,})\s*(?:max|limit|token)',  # "250000 tokens > 200000 maximum"
         r'(\d{4,})\s*(?:max(?:imum)?)\b',  # "200000 maximum"
+        r'maximum context size is (\d+)',  # llama.cpp: "... Maximum context size is 32768"
     ]
     for pattern in patterns:
         match = re.search(pattern, error_lower)
@@ -1263,6 +1264,39 @@ def parse_context_limit_from_error(error_msg: str) -> Optional[int]:
             if 1024 <= limit <= 10_000_000:
                 return limit
     return None
+
+
+def resolve_wire_max_output_tokens(
+    max_tokens: int | None,
+    *,
+    provider: str = "",
+    model: str = "",
+) -> int:
+    """Return the output cap that will actually be sent on the wire."""
+    if isinstance(max_tokens, int) and max_tokens > 0:
+        return max_tokens
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(provider)
+        if profile:
+            cap = profile.get_max_tokens(model)
+            if isinstance(cap, int) and cap > 0:
+                return cap
+    except Exception:
+        pass
+    return 4096
+
+
+def compute_safe_output_tokens_for_window(
+    context_length: int,
+    request_input_tokens: int,
+    *,
+    margin: int = 64,
+    floor: int = 256,
+) -> int:
+    """Output budget so input + max_tokens fits in a shared context window."""
+    return max(floor, context_length - request_input_tokens - margin)
 
 
 def get_context_length_from_provider_error(

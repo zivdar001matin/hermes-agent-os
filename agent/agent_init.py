@@ -1923,6 +1923,16 @@ def init_agent(
             abort_on_summary_failure=compression_abort_on_summary_failure,
             max_tokens=agent.max_tokens,
         )
+    _compression_threshold_tokens = _compression_cfg.get("threshold_tokens")
+    if _compression_threshold_tokens is not None:
+        try:
+            _cap = int(_compression_threshold_tokens)
+        except (TypeError, ValueError):
+            _cap = 0
+        if _cap > 0:
+            _cc = getattr(agent, "context_compressor", None)
+            if _cc is not None and hasattr(_cc, "threshold_tokens"):
+                _cc.threshold_tokens = min(int(_cc.threshold_tokens), _cap)
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         try:
