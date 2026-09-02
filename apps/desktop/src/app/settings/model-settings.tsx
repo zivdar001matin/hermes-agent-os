@@ -120,6 +120,7 @@ const AUX_TASKS: readonly AuxTaskMeta[] = [
   { key: 'approval' },
   { key: 'mcp' },
   { key: 'title_generation' },
+  { key: 'simple_tools' },
   { key: 'curator' }
 ]
 

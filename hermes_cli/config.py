@@ -1816,6 +1816,24 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
+        # Simple-tools follow-up — after the main model emits only cheap
+        # read-only tools (read_file, search_files, web_search, …), continue
+        # gathering on the auxiliary model instead of another main-model turn.
+        # Off by default: only useful when aux is a distinct fast/cheap model.
+        # Pin provider/model/base_url like any other aux slot, then set
+        # enabled: true. tools: empty list uses the built-in read-only set.
+        "simple_tools": {
+            "enabled": False,
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 60,
+            "extra_body": {},
+            "reasoning_effort": "",
+            "max_iterations": 4,
+            "tools": [],
+        },
         "moa_reference": {
             "provider": "auto",
             "model": "",

@@ -5182,6 +5182,23 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                if agent._tool_guardrail_halt_decision is None:
+                    try:
+                        from agent.aux_simple_tools import maybe_run_aux_simple_tool_followup
+
+                        maybe_run_aux_simple_tool_followup(
+                            agent,
+                            messages,
+                            assistant_message,
+                            effective_task_id,
+                            api_call_count,
+                            conversation_history=conversation_history,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "auxiliary simple-tool follow-up failed", exc_info=True,
+                        )
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"

@@ -103,6 +103,7 @@ def test_register_auxiliary_task_rejects_builtin_keys():
         "approval",
         "mcp",
         "title_generation",
+        "simple_tools",
         "skills_hub",
         "curator",
     ):

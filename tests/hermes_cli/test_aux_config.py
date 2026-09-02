@@ -43,6 +43,16 @@ def test_title_generation_present_in_default_config():
     assert tg["extra_body"] == {}
 
 
+def test_simple_tools_present_in_default_config():
+    assert "simple_tools" in DEFAULT_CONFIG["auxiliary"]
+    slot = DEFAULT_CONFIG["auxiliary"]["simple_tools"]
+    assert slot["enabled"] is False
+    assert slot["provider"] == "auto"
+    assert slot["max_iterations"] == 4
+    assert slot["tools"] == []
+    assert "simple_tools" in {key for key, _name, _desc in _AUX_TASKS}
+
+
 def test_session_search_no_longer_appears_in_auxiliary_model_config():
     """session_search is a direct DB-backed tool, not an auxiliary LLM task."""
     assert "session_search" not in DEFAULT_CONFIG["auxiliary"]
