@@ -2601,58 +2601,87 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         import httpx as _httpx
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
         # wins over the HERMES_API_TIMEOUT env default if the user set it.
+        # ``0`` in config means unlimited (wait until the provider responds).
         _provider_timeout_cfg = get_provider_request_timeout(agent.provider, agent.model)
-        _base_timeout = (
-            _provider_timeout_cfg
-            if _provider_timeout_cfg is not None
-            else env_float("HERMES_API_TIMEOUT", 1800.0)
-        )
-        # Read timeout: config wins here too.  Otherwise use
-        # HERMES_STREAM_READ_TIMEOUT (default 120s) for cloud providers.
-        if _provider_timeout_cfg is not None:
+        if _provider_timeout_cfg == float("inf"):
+            _base_timeout = None
+            _stream_read_timeout = None
+        elif _provider_timeout_cfg is not None:
+            _base_timeout = _provider_timeout_cfg
             _stream_read_timeout = _provider_timeout_cfg
         else:
-            _stream_read_timeout = env_float("HERMES_STREAM_READ_TIMEOUT", 120.0)
-            # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
-            # prefill on large contexts before producing the first token.
-            # Auto-increase the httpx read timeout unless the user explicitly
-            # overrode HERMES_STREAM_READ_TIMEOUT.
-            if _stream_read_timeout == 120.0 and agent.base_url and is_local_endpoint(agent.base_url):
-                _stream_read_timeout = _base_timeout
-                logger.debug(
-                    "Local provider detected (%s) — stream read timeout raised to %.0fs",
-                    agent.base_url, _stream_read_timeout,
-                )
-            elif (
-                _stream_read_timeout == 120.0
-                and _stream_stale_timeout is not None
-                and _stream_stale_timeout != float("inf")
-                and _stream_stale_timeout > _stream_read_timeout
-            ):
-                # Cloud reasoning models (e.g. Opus) routinely pause mid-stream
-                # for minutes during extended thinking.  The stale-stream
-                # detector is deliberately scaled up to tolerate this (180–300s,
-                # see the stale-timeout block below), but the raw httpx socket
-                # read timeout defaulted to a flat 120s and fired *first* —
-                # tearing down a healthy reasoning stream before the stale
-                # detector (which owns retry + diagnostics) could act.  Keep the
-                # socket read timeout in step with the detector so it no longer
-                # preempts it.
-                _stream_read_timeout = _stream_stale_timeout
-                logger.debug(
-                    "Cloud reasoning stream — read timeout raised to %.0fs to "
-                    "match stale-stream detector", _stream_read_timeout,
-                )
+            _env_api_timeout = os.getenv("HERMES_API_TIMEOUT", "").strip()
+            if _env_api_timeout:
+                try:
+                    _parsed_api = float(_env_api_timeout)
+                except (TypeError, ValueError):
+                    _parsed_api = 1800.0
+                _base_timeout = None if _parsed_api <= 0 else _parsed_api
+            else:
+                _base_timeout = 1800.0
+            # Read timeout: config wins here too.  Otherwise use
+            # HERMES_STREAM_READ_TIMEOUT (default 120s) for cloud providers.
+            if _base_timeout is None:
+                _stream_read_timeout = None
+            else:
+                _stream_read_timeout = env_float("HERMES_STREAM_READ_TIMEOUT", 120.0)
+                # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
+                # prefill on large contexts before producing the first token.
+                # Auto-increase the httpx read timeout unless the user explicitly
+                # overrode HERMES_STREAM_READ_TIMEOUT.
+                if _stream_read_timeout == 120.0 and agent.base_url and is_local_endpoint(agent.base_url):
+                    _stream_read_timeout = _base_timeout
+                    logger.debug(
+                        "Local provider detected (%s) — stream read timeout raised to %.0fs",
+                        agent.base_url, _stream_read_timeout,
+                    )
+                elif (
+                    _stream_read_timeout == 120.0
+                    and _stream_stale_timeout is not None
+                    and _stream_stale_timeout != float("inf")
+                    and _stream_stale_timeout > _stream_read_timeout
+                ):
+                    # Cloud reasoning models (e.g. Opus) routinely pause mid-stream
+                    # for minutes during extended thinking.  The stale-stream
+                    # detector is deliberately scaled up to tolerate this (180–300s,
+                    # see the stale-timeout block below), but the raw httpx socket
+                    # read timeout defaulted to a flat 120s and fired *first* —
+                    # tearing down a healthy reasoning stream before the stale
+                    # detector (which owns retry + diagnostics) could act.  Keep the
+                    # socket read timeout in step with the detector so it no longer
+                    # preempts it.
+                    _stream_read_timeout = _stream_stale_timeout
+                    logger.debug(
+                        "Cloud reasoning stream — read timeout raised to %.0fs to "
+                        "match stale-stream detector", _stream_read_timeout,
+                    )
+        # Unlimited local inference: no httpx read cap when stale detection is off.
+        if (
+            _stream_read_timeout is not None
+            and _stream_stale_timeout == float("inf")
+            and agent.base_url
+            and is_local_endpoint(agent.base_url)
+        ):
+            _stream_read_timeout = None
+            logger.debug(
+                "Local provider detected (%s) — stream read timeout disabled (unlimited)",
+                agent.base_url,
+            )
         # Cap connect/pool at 60s even when provider timeout is higher.
         # connect/pool cover TCP handshake, not model inference.
-        _conn_cap = min(_base_timeout, 60.0) if _provider_timeout_cfg is not None else 30.0
+        _write_timeout = _base_timeout if _base_timeout is not None else 1800.0
+        _conn_cap = (
+            min(_write_timeout, 60.0)
+            if _base_timeout is not None
+            else 30.0
+        )
         stream_kwargs = {
             **api_kwargs,
             "stream": True,
             "timeout": _httpx.Timeout(
                 connect=_conn_cap,
                 read=_stream_read_timeout,
-                write=_base_timeout,
+                write=_write_timeout,
                 pool=_conn_cap,
             ),
         }
@@ -3570,6 +3599,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if _stream_stale_timeout_base == 180.0 and agent.base_url and is_local_endpoint(agent.base_url):
         # Read config.yaml ``agent.local_stream_stale_timeout`` (default 900),
         # env var ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` overrides for escape-hatch.
+        # ``0`` = unlimited — wait until the local model responds (Qwen/MLX prefill).
         _local_default = 900.0
         try:
             from hermes_cli.config import load_config
@@ -3582,10 +3612,25 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _local_default = float(_v)
         except Exception:
             pass
-        _stream_stale_timeout = env_float("HERMES_LOCAL_STREAM_STALE_TIMEOUT", _local_default)
+        _env_raw = os.getenv("HERMES_LOCAL_STREAM_STALE_TIMEOUT", "").strip()
+        if _env_raw:
+            try:
+                _parsed_local = float(_env_raw)
+            except (TypeError, ValueError):
+                _parsed_local = _local_default
+            _stream_stale_timeout = (
+                float("inf") if _parsed_local <= 0 else _parsed_local
+            )
+        elif _local_default <= 0:
+            _stream_stale_timeout = float("inf")
+        else:
+            _stream_stale_timeout = _local_default
         logger.debug(
-            "Local provider detected (%s) — stale stream timeout set to %.0fs",
-            agent.base_url, _stream_stale_timeout,
+            "Local provider detected (%s) — stale stream timeout set to %s",
+            agent.base_url,
+            "unlimited"
+            if _stream_stale_timeout == float("inf")
+            else f"{_stream_stale_timeout:.0f}s",
         )
     else:
         # Scale the stale timeout for large contexts: slow models (like Opus)

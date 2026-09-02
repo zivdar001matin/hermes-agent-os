@@ -1171,6 +1171,7 @@ DEFAULT_CONFIG = {
         # infinite disable so a wedged local server eventually trips the
         # detector instead of hanging forever. The env var
         # ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` overrides for escape-hatch use.
+        # ``0`` = unlimited — wait until the local model responds.
         "local_stream_stale_timeout": 900,
         # How user-attached images are presented to the main model on each turn.
         #   "auto"   — attach natively when the active model reports

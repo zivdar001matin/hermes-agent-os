@@ -112,6 +112,22 @@ def test_invalid_timeout_values_return_none(monkeypatch, tmp_path):
     assert get_provider_request_timeout("ollama-local") is None
 
 
+def test_zero_timeout_means_unlimited(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          custom:
+            request_timeout_seconds: 0
+            stale_timeout_seconds: 0
+        """,
+    )
+
+    assert get_provider_request_timeout("custom", "qwen3") == float("inf")
+    assert get_provider_stale_timeout("custom", "qwen3") == float("inf")
+
+
 def test_invalid_stale_timeout_values_return_none(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _write_config(
