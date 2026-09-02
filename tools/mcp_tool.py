@@ -2628,6 +2628,8 @@ class MCPServerTask:
                     kwargs: dict = {
                         "follow_redirects": True,
                         "verify": _verify_for_factory,
+                        # Ignore host-injected HTTP(S)_PROXY — breaks Docker-internal MCP.
+                        "trust_env": False,
                     }
                     if timeout is not None:
                         kwargs["timeout"] = timeout
@@ -2690,6 +2692,11 @@ class MCPServerTask:
                 "follow_redirects": True,
                 "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                 "verify": ssl_verify,
+                # Ignore host-injected HTTP(S)_PROXY — breaks Docker-internal MCP.
+                "trust_env": False,
+                # Fresh TCP connect each session — avoids stale Docker IP reuse
+                # after django/celery containers restart and swap addresses.
+                "limits": httpx.Limits(max_keepalive_connections=0),
                 "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
             }
             if headers:
