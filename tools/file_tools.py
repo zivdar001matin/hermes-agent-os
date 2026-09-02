@@ -1229,12 +1229,20 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # Block binary files by extension (no I/O).
         if has_binary_extension(str(_resolved)):
             _ext = _resolved.suffix.lower()
-            return json.dumps({
-                "error": (
+            if _ext in {".xlsx", ".docx"}:
+                hint = (
+                    f"Cannot read binary file '{path}' ({_ext}) because document "
+                    "extraction failed. Do not unzip OOXML with zipfile or execute_code "
+                    "(absolute /xl/ relationship targets become xl/xl/... and fail). "
+                    "If a companion .extracted.txt or ATTACHED_DOCUMENTS.md exists in "
+                    "this session, read that instead."
+                )
+            else:
+                hint = (
                     f"Cannot read binary file '{path}' ({_ext}). "
                     "Use vision_analyze for images, or terminal to inspect binary files."
-                ),
-            })
+                )
+            return json.dumps({"error": hint})
 
         # ── Hermes internal path guard ────────────────────────────────
         # Prevent prompt injection via catalog or hub metadata files,

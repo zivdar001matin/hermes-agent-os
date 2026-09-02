@@ -962,6 +962,7 @@ Do NOT use grep/rg/find to search — use search_files instead.
 Do NOT use ls to list directories — use search_files(target='files') instead.
 Do NOT use sed/awk to edit files — use patch instead.
 Do NOT use echo/cat heredoc to create files — use write_file instead.
+Do NOT python -c "import openpyxl" (or pip install it) to read .xlsx/.docx — native read_file already extracts them to text.
 Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 Because exported environment state persists, activate a virtualenv or export setup variables once per session; do not re-source the same environment before every command unless a command proves the shell state was reset.
 

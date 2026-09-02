@@ -713,6 +713,12 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
         self.assertIn("shell_quote", desc)
         self.assertIn("retry", desc)
 
+    def test_description_warns_against_unzipping_office_docs(self):
+        desc = build_execute_code_schema()["description"]
+        self.assertIn("zipfile", desc)
+        self.assertIn(".xlsx", desc)
+        self.assertIn("openpyxl", desc)
+
     def test_none_defaults_to_all_tools(self):
         schema_none = build_execute_code_schema(None)
         schema_all = build_execute_code_schema(SANDBOX_ALLOWED_TOOLS)

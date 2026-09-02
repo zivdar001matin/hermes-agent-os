@@ -141,8 +141,8 @@ def _extract_xlsx(path: str) -> str:
             for name, state, rid in sheets:
                 if state in {"hidden", "veryHidden"}:
                     continue
-                part = _sheet_part(rels.get(rid, ""))
-                if part not in names:
+                part = _resolve_sheet_part(rels.get(rid, ""), names)
+                if not part:
                     continue
                 try:
                     rows = _sheet_rows(zf.read(part), shared)
@@ -192,12 +192,52 @@ def _workbook_rels(zf: zipfile.ZipFile, names: set[str]) -> dict[str, str]:
     except ET.ParseError:
         return {}
     rel_tag = f"{{{_NS_PKG_REL}}}Relationship"
-    return {rel.get("Id", ""): rel.get("Target", "") for rel in root.iter(rel_tag) if rel.get("Id")}
+    rels = {
+        rel.get("Id", ""): rel.get("Target", "")
+        for rel in root.iter(rel_tag)
+        if rel.get("Id")
+    }
+    if rels:
+        return rels
+    # Some exporters omit the package namespace on Relationship elements.
+    return {
+        rel.get("Id", ""): rel.get("Target", "")
+        for rel in root.iter()
+        if rel.tag.rsplit("}", 1)[-1] == "Relationship" and rel.get("Id")
+    }
 
 
 def _sheet_part(target: str) -> str:
-    target = target.lstrip("/")
+    target = (target or "").replace("\\", "/").split("?", 1)[0].strip().lstrip("/")
+    if not target:
+        return ""
     return posixpath.normpath(target if target.startswith("xl/") else f"xl/{target}")
+
+
+def _resolve_sheet_part(target: str, names: set[str]) -> str:
+    """Map a workbook relationship Target onto a zip member name.
+
+    Excel/LibreOffice sometimes store ``Target="/xl/worksheets/sheet1.xml"``
+    (package-root absolute). Homemade parsers that then prefix ``xl/`` look
+    up ``xl/xl/worksheets/...`` and fail; we normalize that here.
+    """
+    candidates: list[str] = []
+    part = _sheet_part(target)
+    if part:
+        candidates.append(part)
+        if part.startswith("xl/xl/"):
+            candidates.append(part[len("xl/") :])
+    base = posixpath.basename(part) if part else posixpath.basename((target or "").replace("\\", "/"))
+    if base:
+        candidates.extend(
+            name
+            for name in names
+            if name.endswith("/" + base) and "/worksheets/" in name
+        )
+    for candidate in candidates:
+        if candidate in names:
+            return candidate
+    return ""
 
 
 def _col_index(ref: str) -> int:
