@@ -11,6 +11,21 @@ def _coerce_timeout(raw: object) -> float | None:
     return timeout
 
 
+def _coerce_unlimited_timeout(raw: object) -> float | None:
+    """Parse a timeout value where ``0`` means unlimited (``float('inf')``)."""
+    if raw is None:
+        return None
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if timeout < 0:
+        return None
+    if timeout == 0:
+        return float("inf")
+    return timeout
+
+
 def get_provider_request_timeout(
     provider_id: str, model: str | None = None
 ) -> float | None:
@@ -33,11 +48,11 @@ def get_provider_request_timeout(
 
     model_config = _get_model_config(provider_config, model)
     if model_config is not None:
-        timeout = _coerce_timeout(model_config.get("timeout_seconds"))
+        timeout = _coerce_unlimited_timeout(model_config.get("timeout_seconds"))
         if timeout is not None:
             return timeout
 
-    return _coerce_timeout(provider_config.get("request_timeout_seconds"))
+    return _coerce_unlimited_timeout(provider_config.get("request_timeout_seconds"))
 
 
 def get_provider_stale_timeout(
@@ -62,11 +77,11 @@ def get_provider_stale_timeout(
 
     model_config = _get_model_config(provider_config, model)
     if model_config is not None:
-        timeout = _coerce_timeout(model_config.get("stale_timeout_seconds"))
+        timeout = _coerce_unlimited_timeout(model_config.get("stale_timeout_seconds"))
         if timeout is not None:
             return timeout
 
-    return _coerce_timeout(provider_config.get("stale_timeout_seconds"))
+    return _coerce_unlimited_timeout(provider_config.get("stale_timeout_seconds"))
 
 
 def _get_model_config(
