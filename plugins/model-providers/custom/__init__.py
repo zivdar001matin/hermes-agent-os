@@ -4,9 +4,8 @@ Covers any endpoint registered as provider="custom", including local
 Ollama instances and OpenAI-compatible reasoning endpoints (GLM-5.2 on
 Volcengine ARK, vLLM, llama.cpp). Key quirks:
   - ollama_num_ctx → extra_body.options.num_ctx (local context window)
-  - reasoning_config disabled → top-level reasoning_effort="none"
-    (Ollama /v1/chat/completions ignores think=False — ollama#14820)
-    + extra_body.think = False for /api/chat and proxies
+  - reasoning_config unset / disabled → top-level reasoning_effort="none"
+    + extra_body.chat_template_kwargs.reasoning_effort="none" (MLX/Qwen/vLLM)
   - reasoning_config enabled + effort → top-level reasoning_effort
     (the native OpenAI-compatible format GLM/ARK expect; unset omits it
     so the endpoint's server default applies)
@@ -17,9 +16,38 @@ from typing import Any
 from providers import register_provider
 from providers.base import ProviderProfile
 
+_DEFAULT_TEMPLATE_REASONING_EFFORT = "none"
+
 
 class CustomProfile(ProviderProfile):
-    """Custom/Ollama local provider — think=false and num_ctx support."""
+    """Custom/Ollama local provider — template kwargs and num_ctx support."""
+
+    @staticmethod
+    def _resolve_template_reasoning_effort(reasoning_config: dict | None) -> str:
+        """Map Hermes reasoning_config to chat_template_kwargs.reasoning_effort."""
+        if not reasoning_config or not isinstance(reasoning_config, dict):
+            return _DEFAULT_TEMPLATE_REASONING_EFFORT
+        effort = (reasoning_config.get("effort") or "").strip().lower()
+        enabled = reasoning_config.get("enabled", True)
+        if effort == "none" or enabled is False:
+            return _DEFAULT_TEMPLATE_REASONING_EFFORT
+        if effort:
+            return effort
+        return _DEFAULT_TEMPLATE_REASONING_EFFORT
+
+    @staticmethod
+    def _apply_template_reasoning(
+        extra_body: dict[str, Any], top_level: dict[str, Any], effort: str
+    ) -> None:
+        top_level["reasoning_effort"] = effort
+        if effort == _DEFAULT_TEMPLATE_REASONING_EFFORT:
+            # llama.cpp / Qwen GGUF expects enable_thinking in chat_template_kwargs.
+            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+        else:
+            extra_body["chat_template_kwargs"] = {
+                "enable_thinking": True,
+                "reasoning_effort": effort,
+            }
 
     def build_api_kwargs_extras(
         self,
@@ -37,34 +65,8 @@ class CustomProfile(ProviderProfile):
             options["num_ctx"] = ollama_num_ctx
             extra_body["options"] = options
 
-        # Reasoning / thinking control for custom OpenAI-compatible endpoints
-        # (GLM-5.2 on Volcengine ARK, vLLM, Ollama, llama.cpp, …).
-        #
-        #   - disabled  → extra_body.think = False (Ollama's thinking-off flag)
-        #   - enabled + effort set → TOP-LEVEL reasoning_effort string, the
-        #     format GLM-5.2/ARK and other OpenAI-compatible reasoning APIs
-        #     expect (GLM documents "high" and "max"; "max" is its default).
-        #   - enabled + no effort  → omit both, so the endpoint applies its own
-        #     server-side default (do NOT force a level the user didn't pick).
-        #
-        # We deliberately do NOT emit ``think=True`` on enable: it is an
-        # Ollama-only flag and thinking is already server-default-on for these
-        # backends, so forcing it risks a 400 on GLM/vLLM endpoints that don't
-        # recognize it. Mirrors the DeepSeek/Zai profile precedent.
-        if reasoning_config and isinstance(reasoning_config, dict):
-            _effort = (reasoning_config.get("effort") or "").strip().lower()
-            _enabled = reasoning_config.get("enabled", True)
-            if _effort == "none" or _enabled is False:
-                # Ollama's /v1/chat/completions silently ignores
-                # extra_body.think (only /api/chat honours it — ollama#14820)
-                # but respects the top-level reasoning_effort field, so both
-                # are needed to actually stop a thinking-capable model from
-                # reasoning (#25758). Endpoints that recognize neither simply
-                # ignore them.
-                top_level["reasoning_effort"] = "none"
-                extra_body["think"] = False
-            elif _effort:
-                top_level["reasoning_effort"] = _effort
+        template_effort = self._resolve_template_reasoning_effort(reasoning_config)
+        self._apply_template_reasoning(extra_body, top_level, template_effort)
 
         return extra_body, top_level
 
@@ -93,10 +95,6 @@ custom = CustomProfile(
     ),
     env_vars=(),  # No fixed key — custom endpoint
     base_url="",  # User-configured
-    # Without this, no max_tokens is sent and Ollama falls back to its internal
-    # num_predict=128, truncating responses after a few tokens (#39281). This is
-    # only a floor used when the user hasn't set model.max_tokens — they can
-    # override per-model — so we set it generously rather than lowballing it.
     default_max_tokens=65536,
 )
 
