@@ -57,8 +57,10 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
+    compute_safe_output_tokens_for_window,
     is_output_cap_error,
     parse_available_output_tokens_from_error,
+    resolve_wire_max_output_tokens,
     save_context_length,
 )
 from agent.process_bootstrap import _install_safe_stdio
@@ -3849,6 +3851,53 @@ def run_conversation(
                         _retry.restart_with_compressed_messages = True
                         break
 
+                    # llama.cpp / local OpenAI-compatible servers often return a
+                    # bare "Context size has been exceeded." with no
+                    # available_tokens figure. When input + max_tokens exceeds
+                    # the configured window, shrink the output cap before
+                    # compression — compression cannot fix a budget mismatch
+                    # and message-only token counts hide tool-schema weight.
+                    request_input_estimate = estimate_request_tokens_rough(
+                        api_messages, tools=agent.tools or None,
+                    )
+                    _wire_max = resolve_wire_max_output_tokens(
+                        agent.max_tokens,
+                        provider=getattr(agent, "provider", "") or "",
+                        model=getattr(agent, "model", "") or "",
+                    )
+                    if request_input_estimate + _wire_max > old_ctx:
+                        safe_out = compute_safe_output_tokens_for_window(
+                            old_ctx, request_input_estimate,
+                        )
+                        if safe_out < _wire_max:
+                            agent._ephemeral_max_output_tokens = safe_out
+                            agent._buffer_vprint(
+                                f"⚠️  Prompt + max_tokens exceeds context window — "
+                                f"retrying with max_tokens={safe_out:,} "
+                                f"(estimated_request_tokens={request_input_estimate:,}, "
+                                f"wire_max={_wire_max:,}; context_length={old_ctx:,})"
+                            )
+                            compression_attempts += 1
+                            if compression_attempts > max_compression_attempts:
+                                agent._flush_status_buffer()
+                                agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
+                                agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
+                                logger.error(f"{agent.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
+                                agent._persist_session(messages, conversation_history)
+                                _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
+                                return {
+                                    "final_response": _final_response,
+                                    "messages": messages,
+                                    "completed": False,
+                                    "api_calls": api_call_count,
+                                    "error": _final_response,
+                                    "partial": True,
+                                    "failed": True,
+                                    "compression_exhausted": True,
+                                }
+                            _retry.restart_with_compressed_messages = True
+                            break
+
                     # The error is output-cap-shaped (about max_tokens being
                     # too large) but the provider's wording didn't let us parse
                     # the available output budget.  Compression CANNOT help here
@@ -3962,6 +4011,16 @@ def run_conversation(
 
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
+                    _wire_max = resolve_wire_max_output_tokens(
+                        agent.max_tokens,
+                        provider=getattr(agent, "provider", "") or "",
+                        model=getattr(agent, "model", "") or "",
+                    )
+                    original_request_tokens = estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=active_system_prompt or "",
+                        tools=agent.tools or None,
+                    )
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
@@ -3973,15 +4032,32 @@ def run_conversation(
                     # Re-estimate tokens after compression.  Same-message-count
                     # compression (tool-result pruning, in-place summarization)
                     # can materially reduce request size without reducing the
-                    # message array.  (#39550)
+                    # message array.  Include tool schemas — message-only
+                    # counts caused false "cannot compress further" on local
+                    # llama.cpp when the incompressible floor was tool defs.
+                    # (#39550)
                     new_tokens = estimate_messages_tokens_rough(messages)
+                    new_request_tokens = estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=active_system_prompt or "",
+                        tools=agent.tools or None,
+                    )
                     approx_tokens = new_tokens  # update for downstream logging
 
-                    if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95) or (new_ctx and new_ctx < old_ctx):
+                    if (
+                        len(messages) < original_len
+                        or (
+                            new_request_tokens > 0
+                            and new_request_tokens < original_request_tokens * 0.95
+                        )
+                        or (new_ctx and new_ctx < old_ctx)
+                    ):
                         if len(messages) < original_len:
                             agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
-                        elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
-                            agent._buffer_status(f"🗜️ Compressed ~{original_tokens:,} → ~{new_tokens:,} tokens, retrying...")
+                        elif new_request_tokens > 0 and new_request_tokens < original_request_tokens * 0.95:
+                            agent._buffer_status(
+                                f"🗜️ Compressed ~{original_request_tokens:,} → ~{new_request_tokens:,} tokens, retrying..."
+                            )
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
@@ -3989,10 +4065,18 @@ def run_conversation(
                         # Can't compress further and already at minimum tier
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
-                        agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
-                        logger.error(f"{agent.log_prefix}Context length exceeded: {new_tokens:,} tokens. Cannot compress further.")
+                        if new_request_tokens + _wire_max <= int(old_ctx * 0.9):
+                            agent._vprint(
+                                f"{agent.log_prefix}   💡 Estimated prompt (~{new_request_tokens:,} tokens incl. tools) "
+                                f"fits the configured {old_ctx:,} window but the model server still rejected the request. "
+                                f"Try /new, or verify llama.cpp --ctx-size matches model.context_length.",
+                                force=True,
+                            )
+                        else:
+                            agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
+                        logger.error(f"{agent.log_prefix}Context length exceeded: {new_request_tokens:,} tokens. Cannot compress further.")
                         agent._persist_session(messages, conversation_history)
-                        _final_response = f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further."
+                        _final_response = f"Context length exceeded ({new_request_tokens:,} tokens). Cannot compress further."
                         return {
                             "final_response": _final_response,
                             "messages": messages,
