@@ -209,6 +209,12 @@ COPY --link --chmod=a+rX,go-w . .
 # resolution or downloads.
 RUN uv pip install --no-cache-dir --no-deps -e "."
 
+# Qwen / widget-builder keep `python -c "import openpyxl"` via the terminal
+# tool. Native read_file already extracts .xlsx without this package, but the
+# model ignores that and the missing module logs as a tool WARNING every turn.
+# Pin matches backend/requirements.txt (Django widget runtime).
+RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache-dir "openpyxl==3.1.5"
+
 # Wire the exec shim and install-method stamp.  Files under /opt/hermes are
 # already root-owned (COPY, uv sync, npm install all run as root) and
 # read-only for the hermes user (go-w from the --chmod above).
