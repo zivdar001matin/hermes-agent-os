@@ -438,3 +438,41 @@ async def test_session_header_rejected_without_api_key(adapter, session_db):
         assert resp.status == 403
         data = await resp.json()
         assert "X-Hermes-Session-Key requires API key" in data["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_keepalive_client_disconnect_is_not_500(adapter, session_db):
+    """Keepalive write after the client hangs up must not bubble as aiohttp ERROR."""
+    import asyncio
+
+    from aiohttp.client_exceptions import ClientConnectionResetError
+
+    import gateway.platforms.api_server as api_server_mod
+
+    session_id = session_db.create_session("keepalive-disconnect", "api_server")
+
+    async def fake_run(**kwargs):
+        await asyncio.sleep(0.2)
+        return {"final_response": "late", "session_id": session_id}, {"total_tokens": 1}
+
+    original_write = web.StreamResponse.write
+
+    async def write_fail_on_keepalive(self, data):
+        if data == b": keepalive\n\n":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+        return await original_write(self, data)
+
+    app = _create_session_app(adapter)
+    with (
+        patch.object(api_server_mod, "CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS", 0.01),
+        patch.object(adapter, "_run_agent", side_effect=fake_run),
+        patch.object(web.StreamResponse, "write", write_fail_on_keepalive),
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "read the spreadsheet"},
+            )
+            assert resp.status == 200
+            await resp.text()
+
