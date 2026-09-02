@@ -237,6 +237,38 @@ class TestXlsxExtraction(unittest.TestCase):
         with self.assertRaises(ExtractionError):
             extract_document_text(p)
 
+    def test_absolute_package_root_sheet_targets(self):
+        """Excel often uses Target=\"/xl/worksheets/sheet1.xml\" (package-root).
+
+        Homemade zipfile parsers prefix xl/ and look up xl/xl/worksheets/...
+        Native read_file must still extract the sheet (HSE workbooks, etc.).
+        """
+        r = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        workbook = (
+            f'<workbook xmlns="{_NS_S}" xmlns:r="{r}"><sheets>'
+            f'<sheet name="رویدادهای HSE" sheetId="1" r:id="rId1"/>'
+            f'</sheets></workbook>')
+        rels = (
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Target="/xl/worksheets/sheet1.xml" Type="x"/>'
+            '</Relationships>')
+        shared = f'<sst xmlns="{_NS_S}"><si><t>incident</t></si></sst>'
+        sheet1 = (
+            f'<worksheet xmlns="{_NS_S}"><sheetData>'
+            '<row r="1"><c r="A1" t="s"><v>0</v></c></row>'
+            '</sheetData></worksheet>')
+        p = os.path.join(self.tmp, "hse.xlsx")
+        _write_xlsx(
+            p,
+            workbook=workbook,
+            rels=rels,
+            shared=shared,
+            sheets={"xl/worksheets/sheet1.xml": sheet1},
+        )
+        text = extract_document_text(p)
+        self.assertIn("رویدادهای HSE", text)
+        self.assertIn("incident", text)
+
 
 # ---------------------------------------------------------------------------
 # read_file_tool integration
