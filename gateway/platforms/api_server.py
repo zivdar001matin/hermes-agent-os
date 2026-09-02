@@ -2713,9 +2713,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 data = json.dumps(payload, ensure_ascii=False)
                 await response.write(f"event: {name}\ndata: {data}\n\n".encode("utf-8"))
                 last_write = time.monotonic()
-        except (asyncio.CancelledError, ConnectionResetError):
+        except asyncio.CancelledError:
             task.cancel()
             raise
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as exc:
+            # aiohttp ClientConnectionResetError is an OSError (and in some
+            # versions also ConnectionResetError). Re-raising it becomes
+            # ERROR aiohttp.server while the agent is still working. Match
+            # /v1/chat/completions: cancel the agent and return the stream.
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            logger.info("[api_server] session SSE client disconnected: %s", exc)
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
