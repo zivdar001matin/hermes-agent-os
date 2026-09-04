@@ -242,13 +242,14 @@ class TestCharacterCountGuard(unittest.TestCase):
         last complete line and offers a next_offset, instead of returning an
         error with no content."""
         # 50 lines of 100 chars each = ~5050 chars, well over the 1000 budget.
+        # Explicit limit skips the token budget so this isolates the char path.
         big_content = "\n".join(f"{i}|" + "z" * 98 for i in range(1, 51))
         mock_ops.return_value = _make_fake_ops(
             content=big_content,
             total_lines=50,
             file_size=len(big_content),
         )
-        result = json.loads(read_file_tool("/tmp/huge.txt", task_id="big"))
+        result = json.loads(read_file_tool("/tmp/huge.txt", limit=50, task_id="big"))
         # No hard rejection — content is present.
         self.assertNotIn("error", result)
         self.assertIn("content", result)
@@ -271,7 +272,7 @@ class TestCharacterCountGuard(unittest.TestCase):
         mock_ops.return_value = _make_fake_ops(
             content=big_content, total_lines=1, file_size=len(big_content),
         )
-        result = json.loads(read_file_tool("/tmp/oneline.txt", task_id="oneline"))
+        result = json.loads(read_file_tool("/tmp/oneline.txt", limit=1, task_id="oneline"))
         self.assertNotIn("error", result)
         self.assertTrue(result["content"])  # not empty
         self.assertEqual(result["next_offset"], 2)  # advanced past line 1
@@ -287,7 +288,7 @@ class TestCharacterCountGuard(unittest.TestCase):
         mock_ops.return_value = _make_fake_ops(
             content=big_content, total_lines=50, file_size=len(big_content),
         )
-        result = json.loads(read_file_tool("/tmp/manylines.txt", task_id="manylines"))
+        result = json.loads(read_file_tool("/tmp/manylines.txt", limit=50, task_id="manylines"))
         self.assertTrue(result["truncated"])
         self.assertNotIn("clamped mid-line", result["hint"])
 
@@ -299,18 +300,80 @@ class TestCharacterCountGuard(unittest.TestCase):
         self.assertNotIn("error", result)
         self.assertIn("content", result)
         self.assertNotEqual(result.get("truncated_by"), "bytes")
+        self.assertNotEqual(result.get("truncated_by"), "tokens")
 
     @patch("tools.file_tools._get_file_ops")
     @patch("tools.file_tools._get_max_read_chars", return_value=_DEFAULT_MAX_READ_CHARS)
     def test_content_under_limit_passes(self, _mock_limit, mock_ops):
-        """Content just under the limit should pass through fine."""
+        """Content just under the char limit should pass when limit is explicit."""
         mock_ops.return_value = _make_fake_ops(
             content="y" * (_DEFAULT_MAX_READ_CHARS - 1),
             file_size=_DEFAULT_MAX_READ_CHARS - 1,
         )
-        result = json.loads(read_file_tool("/tmp/justunder.txt", task_id="under"))
+        result = json.loads(
+            read_file_tool("/tmp/justunder.txt", limit=500, task_id="under")
+        )
         self.assertNotIn("error", result)
         self.assertIn("content", result)
+
+
+# ---------------------------------------------------------------------------
+# Token-budget guard (default when limit is omitted)
+# ---------------------------------------------------------------------------
+
+class TestTokenBudgetGuard(unittest.TestCase):
+    """When limit is omitted, read_file caps by estimated tokens."""
+
+    def setUp(self):
+        _read_tracker.clear()
+        from tools.token_budget import reset_token_budget_caches
+        reset_token_budget_caches()
+
+    def tearDown(self):
+        _read_tracker.clear()
+        from tools.token_budget import reset_token_budget_caches
+        reset_token_budget_caches()
+
+    @patch("tools.file_tools._get_file_ops")
+    @patch("tools.token_budget.get_read_file_max_tokens", return_value=50)
+    def test_omitted_limit_truncates_on_token_budget(self, _mock_tok, mock_ops):
+        # Dense Persian lines: arabic/2 so ~100 chars ≈ 50 tokens.
+        lines = [f"{i}|{'سلام' * 20}" for i in range(1, 40)]
+        content = "\n".join(lines)
+        mock_ops.return_value = _make_fake_ops(
+            content=content, total_lines=len(lines), file_size=len(content),
+        )
+        result = json.loads(read_file_tool("/tmp/fa.txt", task_id="tok1"))
+        self.assertNotIn("error", result)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["truncated_by"], "tokens")
+        self.assertIn("next_offset", result)
+        self.assertIn("[truncated at line", result["content"])
+        self.assertIn("call read_file with offset=", result["content"])
+        from tools.token_budget import estimate_tokens
+        # Marker adds a few tokens; body should stay near the budget.
+        self.assertLessEqual(estimate_tokens(result["content"]), 80)
+
+    @patch("tools.file_tools._get_file_ops")
+    @patch("tools.token_budget.get_read_file_max_tokens", return_value=50)
+    def test_explicit_limit_skips_token_budget(self, _mock_tok, mock_ops):
+        lines = [f"{i}|{'سلام' * 20}" for i in range(1, 40)]
+        content = "\n".join(lines)
+        mock_ops.return_value = _make_fake_ops(
+            content=content, total_lines=len(lines), file_size=len(content),
+        )
+        result = json.loads(read_file_tool("/tmp/fa2.txt", limit=40, task_id="tok2"))
+        self.assertNotEqual(result.get("truncated_by"), "tokens")
+        self.assertNotIn("[truncated at line", result.get("content", ""))
+
+    def test_ascii_unchanged_under_default_budget(self):
+        from tools.token_budget import truncate_lines_to_tokens
+
+        text = "\n".join(f"{i}|hello world" for i in range(1, 21))
+        out, lines, trunc, nxt = truncate_lines_to_tokens(text, 4000, start_line=1, total_lines=20)
+        self.assertFalse(trunc)
+        self.assertEqual(out, text)
+        self.assertIsNone(nxt)
 
 
 class TestTruncateToCharBudget(unittest.TestCase):
@@ -799,7 +862,7 @@ class TestConfigOverride(unittest.TestCase):
         """A config value of 50 should trigger truncation for reads over 50 chars,
         with the configured limit reflected in the continuation hint."""
         mock_ops.return_value = _make_fake_ops(content="x" * 60, file_size=60)
-        result = json.loads(read_file_tool("/tmp/cfgtest.txt", task_id="cfg1"))
+        result = json.loads(read_file_tool("/tmp/cfgtest.txt", limit=10, task_id="cfg1"))
         self.assertNotIn("error", result)
         self.assertTrue(result["truncated"])
         self.assertEqual(result["truncated_by"], "bytes")
@@ -811,10 +874,11 @@ class TestConfigOverride(unittest.TestCase):
     def test_custom_config_raises_limit(self, _mock_cfg, mock_ops):
         """A config value of 500K should allow reads up to 500K chars."""
         # 200K chars would be rejected at the default 100K but passes at 500K
+        # when an explicit line limit skips the token budget.
         mock_ops.return_value = _make_fake_ops(
             content="y" * 200_000, file_size=200_000,
         )
-        result = json.loads(read_file_tool("/tmp/cfgtest2.txt", task_id="cfg2"))
+        result = json.loads(read_file_tool("/tmp/cfgtest2.txt", limit=500, task_id="cfg2"))
         self.assertNotIn("error", result)
         self.assertIn("content", result)
 

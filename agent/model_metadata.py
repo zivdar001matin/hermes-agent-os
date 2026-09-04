@@ -7,6 +7,7 @@ and run_agent.py for pre-flight context checks.
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -2597,16 +2598,89 @@ async def get_model_context_length_async(
     )
 
 
-def estimate_tokens_rough(text: str) -> int:
-    """Rough token estimate (~4 chars/token) for pre-flight checks.
+# Chars-per-token divisors for estimate_tokens_rough(). Round the divisor
+# *down* vs measured density so we over-estimate (compaction fires early,
+# recoverable) rather than under-estimate (window overflow, not recoverable).
+# Qwen3.8 llama.cpp /tokenize (2026-09-03): Persian prose 3.05, Persian
+# tabular 2.00, English 4.77 — so Arabic/Persian stays at 2.0.
+LATIN_CHARS_PER_TOKEN = 4.0
+ARABIC_CHARS_PER_TOKEN = 2.0
+CJK_CHARS_PER_TOKEN = 1.5
 
-    Uses ceiling division so short texts (1-3 chars) never estimate as
-    0 tokens, which would cause the compressor and pre-flight checks to
-    systematically undercount when many short tool results are present.
+# Arabic / Persian script (and presentation forms)
+_ARABIC_CHAR_RE = re.compile(
+    "["
+    "\u0600-\u06ff"  # Arabic
+    "\u0750-\u077f"  # Arabic Supplement
+    "\ufb50-\ufdff"  # Arabic Presentation Forms-A
+    "\ufe70-\ufeff"  # Arabic Presentation Forms-B
+    "]"
+)
+
+# CJK Unified Ideographs, Hiragana/Katakana, Hangul Syllables
+_CJK_CHAR_RE = re.compile(
+    "["
+    "\u4e00-\u9fff"  # CJK Unified Ideographs
+    "\u3040-\u30ff"  # Hiragana + Katakana
+    "\uac00-\ud7af"  # Hangul Syllables
+    "]"
+)
+
+
+def estimate_tokens_rough(text: str) -> int:
+    """Estimate token count for pre-flight context checks.
+
+    Uses a script-aware heuristic by default: Latin ~4 chars/token,
+    Arabic/Persian script ~2 chars/token, CJK ~1.5 chars/token. Flat
+    chars/4 systematically *undercounts* Arabic-script and CJK text,
+    which can let the compression gate fire too late.
+
+    Set ``HERMES_TOKEN_ESTIMATOR=tiktoken`` to use ``cl100k_base`` when
+    tiktoken is installed (English-centric; still better than flat /4 for
+    code). Falls back to the heuristic when tiktoken is unavailable.
     """
     if not text:
         return 0
-    return (len(text) + 3) // 4
+    mode = (os.environ.get("HERMES_TOKEN_ESTIMATOR") or "heuristic").strip().lower()
+    if mode in {"tiktoken", "auto", "real"}:
+        enc = _get_tiktoken_encoder()
+        if enc is not None:
+            return len(enc.encode(text))
+        if mode == "tiktoken":
+            logger.debug("HERMES_TOKEN_ESTIMATOR=tiktoken but tiktoken unavailable; using heuristic")
+    return _estimate_text_tokens_heuristic(text)
+
+_tiktoken_encoder = None
+_tiktoken_unavailable = False
+
+
+def _get_tiktoken_encoder():
+    global _tiktoken_encoder, _tiktoken_unavailable
+    if _tiktoken_unavailable:
+        return None
+    if _tiktoken_encoder is not None:
+        return _tiktoken_encoder
+    try:
+        import tiktoken
+
+        _tiktoken_encoder = tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        _tiktoken_unavailable = True
+        return None
+    return _tiktoken_encoder
+
+
+def _estimate_text_tokens_heuristic(text: str) -> int:
+    if not text:
+        return 0
+    arabic = len(_ARABIC_CHAR_RE.findall(text))
+    cjk = len(_CJK_CHAR_RE.findall(text))
+    latin = len(text) - arabic - cjk
+    return math.ceil(
+        latin / LATIN_CHARS_PER_TOKEN
+        + arabic / ARABIC_CHARS_PER_TOKEN
+        + cjk / CJK_CHARS_PER_TOKEN
+    )
 
 
 def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
@@ -2618,12 +2692,12 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     estimated at ~250K tokens and trigger premature context compression.
     """
     _IMAGE_TOKEN_COST = 1500
-    total_chars = 0
+    message_tokens = 0
     image_tokens = 0
     for msg in messages:
-        total_chars += _estimate_message_chars(msg)
+        message_tokens += _estimate_message_tokens(msg)
         image_tokens += _count_image_tokens(msg, _IMAGE_TOKEN_COST)
-    return ((total_chars + 3) // 4) + image_tokens
+    return message_tokens + image_tokens
 
 
 def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
@@ -2652,14 +2726,10 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     return count * cost_per_image
 
 
-def _estimate_message_chars(msg: Dict[str, Any]) -> int:
-    """Char count for token estimation, excluding base64 image data.
-
-    Base64 images are counted via `_count_image_tokens` instead; including
-    their raw chars here would massively overestimate token usage.
-    """
+def _message_shadow_dict(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Message dict with image payloads stripped for size estimation."""
     if not isinstance(msg, dict):
-        return len(str(msg))
+        return {"content": str(msg)}
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
         if k == "_anthropic_content_blocks":
@@ -2682,7 +2752,21 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
                 shadow[k] = v
         else:
             shadow[k] = v
-    return len(str(shadow))
+    return shadow
+
+
+def _estimate_message_tokens(msg: Dict[str, Any]) -> int:
+    """Token estimate for one message, excluding image payload bytes."""
+    return estimate_tokens_rough(str(_message_shadow_dict(msg)))
+
+
+def _estimate_message_chars(msg: Dict[str, Any]) -> int:
+    """Char count for token estimation, excluding base64 image data.
+
+    Base64 images are counted via `_count_image_tokens` instead; including
+    their raw chars here would massively overestimate token usage.
+    """
+    return len(str(_message_shadow_dict(msg)))
 
 
 def estimate_request_tokens_rough(
@@ -2701,7 +2785,7 @@ def estimate_request_tokens_rough(
     """
     total = 0
     if system_prompt:
-        total += (len(system_prompt) + 3) // 4
+        total += estimate_tokens_rough(system_prompt)
     if messages:
         total += estimate_messages_tokens_rough(messages)
     if tools:
@@ -2752,7 +2836,7 @@ def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
     # Fast, stable rough estimate: sum lengths of the major schema fields.
     # This avoids the pathological `str(tools)` path while still scaling with
     # schema size (descriptions + parameters dominate).
-    total_chars = 0
+    total_tokens = 0
     for tool in tools:
         if not isinstance(tool, dict):
             continue
@@ -2766,17 +2850,19 @@ def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
             desc = tool.get("description") or ""
             params = tool.get("parameters") or {}
 
+        parts: List[str] = []
         if isinstance(name, str):
-            total_chars += len(name)
+            parts.append(name)
         if isinstance(desc, str):
-            total_chars += len(desc)
-        # Parameters can be nested; JSON is closer to over-the-wire size than repr().
+            parts.append(desc)
         try:
-            total_chars += len(json.dumps(params, ensure_ascii=False, separators=(",", ":")))
+            parts.append(json.dumps(params, ensure_ascii=False, separators=(",", ":")))
         except Exception:
-            total_chars += len(str(params))
+            parts.append(str(params))
+        blob = "".join(parts)
+        total_tokens += estimate_tokens_rough(blob)
 
-    tokens = (total_chars + 3) // 4
+    tokens = total_tokens
     # Bound the cache: drop the oldest entry when the cap is exceeded so a
     # long-running process can't accumulate an unbounded number of stale
     # ``id(tools)`` entries (id values are recycled after GC anyway).

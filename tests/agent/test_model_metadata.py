@@ -10,6 +10,7 @@ Coverage levels:
   Persistent cache       — save/load, corruption, update, provider isolation
 """
 
+import math
 import time
 
 import pytest
@@ -17,9 +18,12 @@ import yaml
 from unittest.mock import patch, MagicMock
 
 from agent.model_metadata import (
+    ARABIC_CHARS_PER_TOKEN,
+    CJK_CHARS_PER_TOKEN,
     CONTEXT_PROBE_TIERS,
     DEFAULT_CONTEXT_LENGTHS,
     DEFAULT_FALLBACK_CONTEXT,
+    LATIN_CHARS_PER_TOKEN,
     _strip_provider_prefix,
     estimate_tokens_rough,
     estimate_messages_tokens_rough,
@@ -58,9 +62,36 @@ class TestEstimateTokensRough:
         assert long > short
 
     def test_unicode_multibyte(self):
-        """Unicode chars are still 1 Python char each — 4 chars/token holds."""
+        """CJK chars estimate at ~1.5 chars/token, not chars/4."""
         text = "你好世界"  # 4 CJK characters
-        assert estimate_tokens_rough(text) == 1
+        assert estimate_tokens_rough(text) == math.ceil(4 / CJK_CHARS_PER_TOKEN)
+
+    def test_mixed_cjk_latin(self):
+        text = "hello 你好"  # 6 latin + 2 CJK
+        assert estimate_tokens_rough(text) == math.ceil(
+            6 / LATIN_CHARS_PER_TOKEN + 2 / CJK_CHARS_PER_TOKEN
+        )
+
+    def test_persian_roughly_2x_legacy_chars_over_4(self):
+        """Arabic-script text is ~2x denser than flat chars/4."""
+        text = "سلام" * 100  # 400 Arabic-script characters
+        legacy = math.ceil(len(text) / LATIN_CHARS_PER_TOKEN)
+        estimate = estimate_tokens_rough(text)
+        assert estimate == pytest.approx(legacy * 2, rel=0.05)
+        assert estimate == math.ceil(len(text) / ARABIC_CHARS_PER_TOKEN)
+
+    def test_ascii_unchanged_from_chars_over_4(self):
+        """Pure ASCII still matches the old chars/4 (ceil) estimator."""
+        text = "Hello world, this is pure ASCII only text."
+        assert estimate_tokens_rough(text) == math.ceil(len(text) / LATIN_CHARS_PER_TOKEN)
+
+    def test_mixed_persian_ascii_between_pure_scripts(self):
+        """Mixed content lands between pure-ASCII (/4) and pure-Persian (/2)."""
+        text = "HSE-2001 فروردین 11 لوله فولادی صنعتی صبح Near-miss"
+        legacy = math.ceil(len(text) / LATIN_CHARS_PER_TOKEN)
+        dense = math.ceil(len(text) / ARABIC_CHARS_PER_TOKEN)
+        estimate = estimate_tokens_rough(text)
+        assert legacy < estimate < dense
 
 
 class TestEstimateMessagesTokensRough:
@@ -68,21 +99,25 @@ class TestEstimateMessagesTokensRough:
         assert estimate_messages_tokens_rough([]) == 0
 
     def test_single_message_concrete_value(self):
-        """Verify against known str(msg) length (ceiling division)."""
+        """Verify against language-aware token estimate on message shadow."""
+        from agent.model_metadata import _message_shadow_dict
+
         msg = {"role": "user", "content": "a" * 400}
         result = estimate_messages_tokens_rough([msg])
-        n = len(str(msg))
-        expected = (n + 3) // 4
+        expected = estimate_tokens_rough(str(_message_shadow_dict(msg)))
         assert result == expected
 
     def test_multiple_messages_additive(self):
+        from agent.model_metadata import _message_shadow_dict
+
         msgs = [
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi there, how can I help?"},
         ]
         result = estimate_messages_tokens_rough(msgs)
-        n = sum(len(str(m)) for m in msgs)
-        expected = (n + 3) // 4
+        expected = sum(
+            estimate_tokens_rough(str(_message_shadow_dict(m))) for m in msgs
+        )
         assert result == expected
 
     def test_tool_call_message(self):
@@ -91,7 +126,9 @@ class TestEstimateMessagesTokensRough:
                "tool_calls": [{"id": "1", "function": {"name": "terminal", "arguments": "{}"}}]}
         result = estimate_messages_tokens_rough([msg])
         assert result > 0
-        assert result == (len(str(msg)) + 3) // 4
+        from agent.model_metadata import _message_shadow_dict
+
+        assert result == estimate_tokens_rough(str(_message_shadow_dict(msg)))
 
     def test_message_with_list_content(self):
         """Vision messages with multimodal content arrays.
