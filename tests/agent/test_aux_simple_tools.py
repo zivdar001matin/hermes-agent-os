@@ -252,3 +252,117 @@ def test_followup_call_llm_error_does_not_raise(monkeypatch):
         "task-1",
     )
     assert n == 0
+
+
+def test_large_result_summarizes_any_tool(monkeypatch):
+    """Oversized results are summarized even for non-simple tools (terminal)."""
+    from agent.aux_simple_tools import maybe_summarize_large_tool_results
+    from agent.model_metadata import estimate_tokens_rough
+
+    agent = _FakeAgent()
+    monkeypatch.setattr(
+        "agent.aux_simple_tools._task_config",
+        lambda: _ENABLED_DISTINCT,
+    )
+    monkeypatch.setattr(
+        "agent.aux_simple_tools.large_result_threshold_tokens",
+        lambda: 100,
+    )
+
+    huge = "سلام" * 400  # well over 100 estimated tokens
+    assert estimate_tokens_rough(huge) >= 100
+
+    def fake_call_llm(**kwargs):
+        assert kwargs["task"] == "simple_tools"
+        assert kwargs.get("tools") is None
+        msg = SimpleNamespace(
+            content="Log shows OOM at line 42 in worker.py",
+            tool_calls=None,
+        )
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+
+    messages = [
+        {"role": "user", "content": "check the logs"},
+        {
+            "role": "tool",
+            "name": "terminal",
+            "tool_call_id": "call_term",
+            "content": huge,
+        },
+    ]
+    n = maybe_summarize_large_tool_results(
+        agent,
+        messages,
+        SimpleNamespace(tool_calls=[_tc("terminal", call_id="call_term")]),
+    )
+    assert n == 1
+    content = messages[-1]["content"]
+    assert "OOM at line 42" in content
+    assert "Full tool result was" in content
+    assert "narrower arguments" in content
+    assert messages[-1].get("_aux_large_result_summary") is True
+    # Original dump must not remain.
+    assert huge not in content
+
+
+def test_large_result_skips_under_threshold(monkeypatch):
+    from agent.aux_simple_tools import maybe_summarize_large_tool_results
+
+    agent = _FakeAgent()
+    monkeypatch.setattr(
+        "agent.aux_simple_tools._task_config",
+        lambda: _ENABLED_DISTINCT,
+    )
+    monkeypatch.setattr(
+        "agent.aux_simple_tools.large_result_threshold_tokens",
+        lambda: 6000,
+    )
+    called = {"n": 0}
+
+    def fake_call_llm(**kwargs):
+        called["n"] += 1
+        raise AssertionError("should not summarize small results")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+    messages = [
+        {
+            "role": "tool",
+            "name": "read_file",
+            "tool_call_id": "call_1",
+            "content": "short",
+        },
+    ]
+    n = maybe_summarize_large_tool_results(
+        agent, messages, SimpleNamespace(tool_calls=[_tc("read_file")]),
+    )
+    assert n == 0
+    assert called["n"] == 0
+    assert messages[0]["content"] == "short"
+
+
+def test_large_result_disabled_when_threshold_zero(monkeypatch):
+    from agent.aux_simple_tools import maybe_summarize_large_tool_results
+
+    agent = _FakeAgent()
+    monkeypatch.setattr(
+        "agent.aux_simple_tools._task_config",
+        lambda: _ENABLED_DISTINCT,
+    )
+    monkeypatch.setattr(
+        "agent.aux_simple_tools.large_result_threshold_tokens",
+        lambda: 0,
+    )
+    messages = [
+        {
+            "role": "tool",
+            "name": "terminal",
+            "tool_call_id": "c1",
+            "content": "x" * 50_000,
+        },
+    ]
+    n = maybe_summarize_large_tool_results(
+        agent, messages, SimpleNamespace(tool_calls=[_tc("terminal", call_id="c1")]),
+    )
+    assert n == 0

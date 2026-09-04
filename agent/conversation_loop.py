@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -76,6 +77,130 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+_DEDUP_TOOL_RESULT_MARKER = "[duplicate tool result"
+_TOOL_RESULT_HASH_ATTR = "_tool_result_content_hashes"
+
+
+def _dedupe_tool_results_enabled() -> bool:
+    """Return ``tools.dedupe_results`` (default True)."""
+    try:
+        from hermes_cli.config import load_config
+
+        tools = (load_config() or {}).get("tools")
+        if not isinstance(tools, dict) or "dedupe_results" not in tools:
+            return True
+        val = tools.get("dedupe_results")
+        if isinstance(val, bool):
+            return val
+        return str(val).strip().lower() not in {"0", "false", "no", "off"}
+    except Exception:
+        return True
+
+
+def _tool_result_text(msg: Dict[str, Any]) -> str:
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict) and content.get("_multimodal"):
+        return ""
+    try:
+        from agent.message_content import flatten_message_text
+
+        return flatten_message_text(content) or ""
+    except Exception:
+        return str(content) if content is not None else ""
+
+
+def _hash_tool_result(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _tool_result_hash_map(agent: Any) -> Dict[str, Dict[str, str]]:
+    sid = str(getattr(agent, "session_id", "") or "")
+    if getattr(agent, "_tool_result_hash_session_id", None) != sid:
+        setattr(agent, "_tool_result_hash_session_id", sid)
+        setattr(agent, _TOOL_RESULT_HASH_ATTR, {})
+    seen = getattr(agent, _TOOL_RESULT_HASH_ATTR, None)
+    if not isinstance(seen, dict):
+        seen = {}
+        setattr(agent, _TOOL_RESULT_HASH_ATTR, seen)
+    return seen
+
+
+def _remember_tool_result_hashes(agent: Any, messages: List[Dict[str, Any]]) -> None:
+    """Index existing tool results so resume/session reloads still dedupe."""
+    seen = _tool_result_hash_map(agent)
+    if seen:
+        return
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        body = _tool_result_text(msg)
+        if not body or body.startswith(_DEDUP_TOOL_RESULT_MARKER):
+            continue
+        digest = _hash_tool_result(body)
+        seen.setdefault(
+            digest,
+            {
+                "name": str(msg.get("name") or msg.get("tool_name") or "tool"),
+                "tool_call_id": str(msg.get("tool_call_id") or ""),
+            },
+        )
+
+
+def maybe_dedupe_tool_results(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    assistant_message: Any,
+) -> int:
+    """Replace identical tool results with a pointer to the earlier copy.
+
+    ``tools.dedupe_results`` (default True). Hashes are tracked per agent
+    session so a 30K attachment that is read twice does not enter history
+    twice.
+    """
+    if not _dedupe_tool_results_enabled():
+        return 0
+    if getattr(agent, "_in_aux_simple_tools", False):
+        return 0
+
+    from agent.aux_simple_tools import _batch_tool_messages, _replace_tool_content
+
+    _remember_tool_result_hashes(agent, messages)
+    seen = _tool_result_hash_map(agent)
+    tool_calls = getattr(assistant_message, "tool_calls", None) or []
+    batch = _batch_tool_messages(messages, tool_calls)
+    rewritten = 0
+    for msg in batch:
+        if msg.get("_deduped_tool_result"):
+            continue
+        body = _tool_result_text(msg)
+        if not body or body.startswith(_DEDUP_TOOL_RESULT_MARKER):
+            continue
+        digest = _hash_tool_result(body)
+        prior = seen.get(digest)
+        call_id = str(msg.get("tool_call_id") or "")
+        name = str(msg.get("name") or msg.get("tool_name") or "tool")
+        if prior and prior.get("tool_call_id") != call_id:
+            short = digest[:12]
+            prior_name = prior.get("name") or "tool"
+            prior_id = prior.get("tool_call_id") or "earlier"
+            _replace_tool_content(
+                msg,
+                (
+                    f"{_DEDUP_TOOL_RESULT_MARKER} — identical to an earlier "
+                    f"`{prior_name}` result in this session "
+                    f"(tool_call_id={prior_id}, sha256={short}…). "
+                    "The full content is already in history; do not re-read it.]"
+                ),
+            )
+            msg["_deduped_tool_result"] = True
+            rewritten += 1
+            continue
+        seen.setdefault(digest, {"name": name, "tool_call_id": call_id})
+    return rewritten
+
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -5100,8 +5225,21 @@ def run_conversation(
 
                 if agent._tool_guardrail_halt_decision is None:
                     try:
-                        from agent.aux_simple_tools import maybe_run_aux_simple_tool_followup
+                        from agent.aux_simple_tools import (
+                            maybe_run_aux_simple_tool_followup,
+                            maybe_summarize_large_tool_results,
+                        )
 
+                        maybe_dedupe_tool_results(
+                            agent,
+                            messages,
+                            assistant_message,
+                        )
+                        maybe_summarize_large_tool_results(
+                            agent,
+                            messages,
+                            assistant_message,
+                        )
                         maybe_run_aux_simple_tool_followup(
                             agent,
                             messages,
@@ -5112,7 +5250,8 @@ def run_conversation(
                         )
                     except Exception:
                         logger.warning(
-                            "auxiliary simple-tool follow-up failed", exc_info=True,
+                            "auxiliary simple-tool follow-up failed",
+                            exc_info=True,
                         )
 
                 if agent._tool_guardrail_halt_decision is not None:
