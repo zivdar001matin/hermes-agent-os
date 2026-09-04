@@ -209,6 +209,11 @@ COPY --link --chmod=a+rX,go-w . .
 # resolution or downloads.
 RUN uv pip install --no-cache-dir --no-deps -e "."
 
+# DuckDuckGo search backend (web.backend: ddgs). check_web_api_key() gates
+# web_search/web_extract on importability; HERMES_DISABLE_LAZY_INSTALLS=1
+# blocks the runtime lazy-install path, so bake the package in the image.
+RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache-dir "ddgs==9.16.0"
+
 # Wire the exec shim and install-method stamp.  Files under /opt/hermes are
 # already root-owned (COPY, uv sync, npm install all run as root) and
 # read-only for the hermes user (go-w from the --chmod above).
