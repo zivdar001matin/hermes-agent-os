@@ -7,6 +7,7 @@ from agent.skill_utils import (
     extract_skill_conditions,
     get_disabled_skill_names,
     get_external_skills_dirs,
+    get_skills_index_allowlist,
     is_excluded_skill_path,
     is_external_skill_path,
     is_skill_support_path,
@@ -15,6 +16,7 @@ from agent.skill_utils import (
     resolve_skill_config_values,
     skill_matches_platform,
     skill_matches_platform_list,
+    skill_passes_index_allowlist,
 )
 
 
@@ -172,6 +174,41 @@ def test_skill_config_raw_cache_invalidates_on_config_edit(tmp_path, monkeypatch
     os.utime(config_path, None)
 
     assert get_disabled_skill_names() == {"new-skill"}
+
+
+def test_get_skills_index_allowlist_absent_or_empty(tmp_path, monkeypatch):
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._external_dirs_cache_clear()
+
+    assert get_skills_index_allowlist() is None
+
+    (hermes_home / "config.yaml").write_text("skills:\n  index_allowlist: []\n")
+    assert get_skills_index_allowlist() is None
+
+
+def test_get_skills_index_allowlist_non_empty(tmp_path, monkeypatch):
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "skills:\n  index_allowlist: [hermes-agent, pr-review]\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._external_dirs_cache_clear()
+
+    assert get_skills_index_allowlist() == {"hermes-agent", "pr-review"}
+
+
+def test_skill_passes_index_allowlist_matches_frontmatter_or_dir_name():
+    allowlist = {"pr-review"}
+    assert skill_passes_index_allowlist("pr-review", "github/pr-review", allowlist)
+    assert skill_passes_index_allowlist("other", "pr-review", allowlist)
+    assert not skill_passes_index_allowlist("other", "github/other", allowlist)
 
 
 def test_is_external_skill_path_matches_configured_external_dir(tmp_path, monkeypatch):

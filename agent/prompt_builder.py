@@ -24,6 +24,8 @@ from agent.skill_utils import (
     extract_skill_description,
     get_all_skills_dirs,
     get_disabled_skill_names,
+    get_skills_index_allowlist,
+    skill_passes_index_allowlist,
     iter_skill_index_files,
     parse_frontmatter,
     skill_matches_environment,
@@ -1534,6 +1536,7 @@ def build_skills_system_prompt(
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    index_allowlist = get_skills_index_allowlist()
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
@@ -1541,6 +1544,7 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        tuple(sorted(index_allowlist or ())),
         tuple(sorted(compact_categories or ())),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
@@ -1568,6 +1572,12 @@ def build_skills_system_prompt(
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
+            if not skill_passes_index_allowlist(
+                frontmatter_name,
+                skill_name,
+                index_allowlist,
+            ):
+                continue
             if not _skill_should_show(
                 entry.get("conditions") or {},
                 available_tools,
@@ -1592,6 +1602,12 @@ def build_skills_system_prompt(
                 continue
             skill_name = entry["skill_name"]
             if entry["frontmatter_name"] in disabled or skill_name in disabled:
+                continue
+            if not skill_passes_index_allowlist(
+                entry["frontmatter_name"],
+                skill_name,
+                index_allowlist,
+            ):
                 continue
             if not _skill_should_show(
                 extract_skill_conditions(frontmatter),
@@ -1647,6 +1663,12 @@ def build_skills_system_prompt(
                 if frontmatter_name in seen_skill_names:
                     continue
                 if frontmatter_name in disabled or skill_name in disabled:
+                    continue
+                if not skill_passes_index_allowlist(
+                    frontmatter_name,
+                    skill_name,
+                    index_allowlist,
+                ):
                     continue
                 if not _skill_should_show(
                     extract_skill_conditions(frontmatter),

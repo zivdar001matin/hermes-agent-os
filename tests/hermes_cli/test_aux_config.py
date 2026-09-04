@@ -51,6 +51,9 @@ def test_simple_tools_present_in_default_config():
     assert slot["max_iterations"] == 4
     assert slot["tools"] == []
     assert "simple_tools" in {key for key, _name, _desc in _AUX_TASKS}
+    assert DEFAULT_CONFIG["auxiliary"]["large_result_threshold_tokens"] == 6000
+    assert DEFAULT_CONFIG["compression"]["failure_cooldown_max"] == 900
+    assert DEFAULT_CONFIG["tools"]["dedupe_results"] is True
 
 
 def test_session_search_no_longer_appears_in_auxiliary_model_config():

@@ -39,6 +39,24 @@ logger = logging.getLogger(__name__)
 _WARNED_DISABLED_BUNDLES: set = set()
 
 
+def _load_excluded_tool_names() -> frozenset:
+    """Return ``agent.excluded_tools`` as a frozenset of tool function names.
+
+    Intended for *native* tools (e.g. ``patch``, ``skill_manage``). MCP tools
+    belong under ``mcp_servers.<name>.tools.exclude`` — names that never appear
+    in the resolved set are reported as unknown when quiet_mode is False.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        raw = ((load_config() or {}).get("agent") or {}).get("excluded_tools") or []
+    except Exception:
+        return frozenset()
+    if not isinstance(raw, (list, tuple, set)):
+        return frozenset()
+    return frozenset(str(n).strip() for n in raw if str(n).strip())
+
+
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
@@ -300,6 +318,10 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    # Load once so the cache key and the filter always agree (and so we don't
+    # pay load_config() twice on the hot path).
+    excluded_tools = _load_excluded_tool_names()
+
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -321,6 +343,7 @@ def get_tool_definitions(
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
+            excluded_tools,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
         )
@@ -334,8 +357,13 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        excluded_tools=excluded_tools,
+    )
     if quiet_mode:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -359,6 +387,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    excluded_tools: Optional[frozenset] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -441,8 +470,37 @@ def _compute_tool_definitions(
     # needed; plugins respect enabled_toolsets / disabled_toolsets like any
     # other toolset.
 
+    # Per-tool denylist (agent.excluded_tools) — after toolset resolution,
+    # before schema serialization. Prefer native tool names; MCP cuts belong
+    # under mcp_servers.<name>.tools.exclude.
+    excluded = frozenset(excluded_tools or ())
+    matched: set = set()
+    if excluded:
+        present = tools_to_include & excluded
+        matched.update(present)
+        tools_to_include.difference_update(excluded)
+
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+    if excluded:
+        kept = []
+        for t in filtered_tools:
+            name = (t.get("function") or {}).get("name")
+            if name in excluded:
+                matched.add(name)
+                continue
+            kept.append(t)
+        filtered_tools = kept
+        # Warn only on names that aren't known tools at all — a name present
+        # in the registry but absent from *this* assembly (narrow
+        # enabled_toolsets) is not a typo.
+        try:
+            known = set(registry.get_all_tool_names())
+        except Exception:
+            known = set()
+        unknown = excluded - matched - known
+        if unknown and not quiet_mode:
+            print(f"⚠️  excluded_tools: no such tool(s): {sorted(unknown)}")
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references

@@ -458,6 +458,40 @@ class TestCoerceNumberInfNan:
         assert _coerce_number("3.14") == 3.14
         assert _coerce_number("1e3") == 1000
 
+class TestExcludedTools:
+    """agent.excluded_tools drops individual native tools after toolset resolution."""
+
+    def test_excluded_tools_removes_named_tools(self, monkeypatch):
+        from model_tools import get_tool_definitions, _clear_tool_defs_cache
+
+        monkeypatch.setattr(
+            "model_tools._load_excluded_tool_names",
+            lambda: frozenset({"patch"}),
+        )
+        _clear_tool_defs_cache()
+        names = {
+            t["function"]["name"]
+            for t in get_tool_definitions(
+                enabled_toolsets=["file"], quiet_mode=True
+            )
+        }
+        assert "patch" not in names
+        assert "read_file" in names
+
+    def test_excluded_tools_warns_on_unknown_names(self, monkeypatch, capsys):
+        from model_tools import get_tool_definitions, _clear_tool_defs_cache
+
+        monkeypatch.setattr(
+            "model_tools._load_excluded_tool_names",
+            lambda: frozenset({"skills_manage_typo"}),
+        )
+        _clear_tool_defs_cache()
+        get_tool_definitions(enabled_toolsets=["file"], quiet_mode=False)
+        err = capsys.readouterr().out
+        assert "excluded_tools: no such tool(s)" in err
+        assert "skills_manage_typo" in err
+
+
 class TestDisabledToolsetsPlatformBundle:
     """Regression test for #33924: disabling a platform bundle (hermes-*)
     must not remove core tools from other enabled toolsets."""
