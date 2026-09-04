@@ -437,6 +437,17 @@ compression:
   #   off    = Hermes will not auto-trigger compaction; Codex may still compact natively
   codex_app_server_auto: native
 
+# Tool result budgets (estimated tokens via estimate_tokens_rough — script-aware).
+# read_file: applied when the caller omits an explicit line ``limit``.
+# session_search: total payload cap; individual snippets are also capped at 800.
+#
+# tools:
+#   read_file:
+#     max_tokens: 4000
+#   session_search:
+#     max_tokens: 4000
+#   dedupe_results: true
+
   # Number of non-system messages to protect at the head of the transcript, in
   # ADDITION to the system prompt (which is always implicitly protected).
   # Head messages are NEVER summarized — they survive every compression
@@ -499,6 +510,11 @@ prompt_caching:
 # Other providers pick a sensible default automatically.
 #
 # auxiliary:
+#   # Summarize any single tool result above this many estimated tokens on the
+#   # aux model before it re-enters main-model history. Independent of the
+#   # simple_tools allowlist. Set 0 to disable. Default 6000.
+#   large_result_threshold_tokens: 6000
+#
 #   # Image analysis: vision_analyze tool + browser screenshots
 #   vision:
 #     provider: "auto"

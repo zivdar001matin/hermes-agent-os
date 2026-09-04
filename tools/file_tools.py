@@ -9,6 +9,7 @@ import posixpath
 import sys
 import threading
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import has_binary_extension
@@ -50,13 +51,14 @@ def _expand_tilde(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Read-size guard: cap the character count returned to the model.
-# We're model-agnostic so we can't count tokens; characters are a safe proxy.
-# 100K chars ≈ 25–35K tokens across typical tokenisers.  Files larger than
-# this in a single read are a context-window hazard — the model should use
-# offset+limit to read the relevant section.
+# Read-size guards.
 #
-# Configurable via config.yaml:  file_read_max_chars: 200000
+# 1. Token budget (primary, when the caller omits ``limit``): cap at
+#    ``tools.read_file.max_tokens`` (default 4000) using estimate_tokens_rough
+#    so Arabic-script text is not under-capped relative to English.
+# 2. Character budget (always-on hard ceiling): ``file_read_max_chars``
+#    (default 100K) for pathological wide/minified lines that sail past
+#    the line-count limit.
 # ---------------------------------------------------------------------------
 _DEFAULT_MAX_READ_CHARS = 100_000
 _max_read_chars_cached: int | None = None
@@ -127,6 +129,80 @@ def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bo
         kept.append(lines[0][:max_chars])
 
     return "\n".join(kept), len(kept), True
+
+
+def _apply_read_budgets(
+    content: str,
+    *,
+    offset: int,
+    total_lines: Any,
+    apply_token_cap: bool,
+) -> tuple[str, dict]:
+    """Apply token (optional) then char budgets to line-numbered content.
+
+    Returns ``(content, meta)`` where meta may include truncated / hint /
+    next_offset / truncated_by keys to merge into the tool result.
+    """
+    meta: dict = {}
+    if not content:
+        return content, meta
+
+    if apply_token_cap:
+        from tools.token_budget import get_read_file_max_tokens, truncate_lines_to_tokens
+
+        max_tokens = get_read_file_max_tokens()
+        trimmed, lines_kept, truncated, next_offset = truncate_lines_to_tokens(
+            content,
+            max_tokens,
+            start_line=offset,
+            total_lines=total_lines,
+        )
+        if truncated:
+            content = trimmed
+            meta["truncated"] = True
+            meta["truncated_by"] = "tokens"
+            meta["next_offset"] = next_offset
+            meta["hint"] = (
+                f"Output truncated at the {max_tokens}-token read budget after "
+                f"{lines_kept} line(s). Use offset={next_offset} to continue."
+            )
+
+    max_chars = _get_max_read_chars()
+    # Strip a prior token-budget marker before measuring chars so we don't
+    # double-count; re-apply after char trim if needed.
+    body = content
+    marker_suffix = ""
+    marker_prefix = "\n[truncated at line "
+    if meta.get("truncated_by") == "tokens" and marker_prefix in content:
+        idx = content.rfind(marker_prefix)
+        if idx >= 0:
+            body = content[:idx]
+            marker_suffix = content[idx:]
+
+    if len(body) > max_chars:
+        trimmed, lines_kept, _ = _truncate_to_char_budget(body, max_chars)
+        next_offset = offset + lines_kept
+        shown_end = offset + lines_kept - 1
+        content = trimmed
+        meta["truncated"] = True
+        meta["truncated_by"] = "bytes"
+        meta["next_offset"] = next_offset
+        meta["hint"] = (
+            f"Output truncated at the {max_chars:,}-char read budget "
+            f"after {lines_kept} line(s) (showing lines {offset}-"
+            f"{shown_end} of {total_lines}). Use offset={next_offset} "
+            "to continue."
+        )
+        if len(trimmed.split("\n", 1)[0]) >= max_chars:
+            meta["hint"] += (
+                " Note: the first line alone exceeded the budget and "
+                "was clamped mid-line; its remainder is not "
+                "retrievable via offset."
+            )
+    elif marker_suffix:
+        content = body + marker_suffix
+
+    return content, meta
 
 
 # If the total file size exceeds this AND the caller didn't specify a narrow
@@ -1147,9 +1223,25 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
-    """Read a file with pagination and line numbers."""
+def read_file_tool(
+    path: str,
+    offset: int = 1,
+    limit: int | None = None,
+    task_id: str = "default",
+) -> str:
+    """Read a file with pagination and line numbers.
+
+    When ``limit`` is omitted, a default line page is used and the result is
+    also capped by ``tools.read_file.max_tokens`` (estimated tokens). An
+    explicit ``limit`` skips the token budget (caller asked for that many
+    lines) but the character hard-ceiling still applies.
+    """
     try:
+        apply_token_cap = limit is None
+        if limit is None:
+            from tools.file_operations import DEFAULT_READ_LIMIT
+
+            limit = DEFAULT_READ_LIMIT
         offset, limit = normalize_read_pagination(offset, limit)
 
         # ── Device path guard ─────────────────────────────────────────
@@ -1194,33 +1286,14 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                         f"Use offset={end_line + 1} to continue reading "
                         f"(showing {offset}-{min(end_line, total_lines)} of {total_lines} lines)"
                     )
-                content_len = len(result_dict["content"])
-                max_chars = _get_max_read_chars()
-                if content_len > max_chars:
-                    # Graceful char-budget truncation (nearai/ironclaw#5029):
-                    # trim to the last complete line that fits and offer a
-                    # next_offset rather than rejecting the whole extraction.
-                    trimmed, lines_kept, _ = _truncate_to_char_budget(
-                        result_dict["content"], max_chars
-                    )
-                    next_offset = offset + lines_kept
-                    shown_end = offset + lines_kept - 1
-                    result_dict["content"] = trimmed
-                    result_dict["truncated"] = True
-                    result_dict["truncated_by"] = "bytes"
-                    result_dict["next_offset"] = next_offset
-                    result_dict["hint"] = (
-                        f"Output truncated at the {max_chars:,}-char read budget "
-                        f"after {lines_kept} line(s) (showing lines {offset}-"
-                        f"{shown_end} of {total_lines}). Use offset={next_offset} "
-                        "to continue."
-                    )
-                    if len(trimmed.split("\n", 1)[0]) >= max_chars:
-                        result_dict["hint"] += (
-                            " Note: the first line alone exceeded the budget and "
-                            "was clamped mid-line; its remainder is not "
-                            "retrievable via offset."
-                        )
+                content, budget_meta = _apply_read_budgets(
+                    result_dict["content"],
+                    offset=offset,
+                    total_lines=total_lines,
+                    apply_token_cap=apply_token_cap,
+                )
+                result_dict["content"] = content
+                result_dict.update(budget_meta)
                 if result_dict["content"]:
                     result_dict["content"] = redact_sensitive_text(result_dict["content"], file_read=True)
                 return json.dumps(result_dict, ensure_ascii=False)
@@ -1325,47 +1398,19 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         result_dict = result.to_dict()
         result_dict["resolved_path"] = resolved_str
 
-        # ── Character-count guard ─────────────────────────────────────
-        # We're model-agnostic so we can't count tokens; characters are
-        # the best proxy we have.  If the read produced an unreasonable
-        # amount of content, reject it and tell the model to narrow down.
-        # Note: we check the formatted content (with line-number prefixes),
-        # not the raw file size, because that's what actually enters context.
+        # ── Size guards (token budget when limit omitted; char hard cap) ──
         # Check BEFORE redaction to avoid expensive regex on huge content.
-        content_len = len(result.content or "")
         file_size = result_dict.get("file_size", 0)
-        max_chars = _get_max_read_chars()
-        if content_len > max_chars:
-            # Graceful char-budget truncation (ported from nearai/ironclaw#5029).
-            # Instead of rejecting the whole read — which forces the model to
-            # guess a smaller `limit` and wastes a round-trip returning nothing
-            # — trim to the last complete line that fits and offer a
-            # `next_offset` so the model can paginate forward. This rescues the
-            # "few but very long lines" case (logs, wide CSVs, minified data)
-            # that sails past the line-count `limit` but blows the char budget.
-            total_lines = result_dict.get("total_lines", "unknown")
-            trimmed, lines_kept, _ = _truncate_to_char_budget(
-                result.content or "", max_chars
-            )
-            next_offset = offset + lines_kept
-            shown_end = offset + lines_kept - 1
-            result.content = trimmed
-            result_dict["content"] = trimmed
-            result_dict["truncated"] = True
-            result_dict["truncated_by"] = "bytes"
-            result_dict["next_offset"] = next_offset
-            result_dict["hint"] = (
-                f"Output truncated at the {max_chars:,}-char read budget after "
-                f"{lines_kept} line(s) (showing lines {offset}-{shown_end} of "
-                f"{total_lines}). Use offset={next_offset} to continue."
-            )
-            if len(trimmed.split("\n", 1)[0]) >= max_chars:
-                result_dict["hint"] += (
-                    " Note: the first line alone exceeded the budget and was "
-                    "clamped mid-line; its remainder is not retrievable via "
-                    "offset."
-                )
-            content_len = len(trimmed)
+        content, budget_meta = _apply_read_budgets(
+            result.content or "",
+            offset=offset,
+            total_lines=result_dict.get("total_lines", "unknown"),
+            apply_token_cap=apply_token_cap,
+        )
+        if budget_meta:
+            result.content = content
+            result_dict["content"] = content
+            result_dict.update(budget_meta)
 
         # ── Redact secrets (after guard check to skip oversized content) ──
         if result.content:
@@ -2009,13 +2054,13 @@ def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. When limit is omitted, results are capped at ~4000 estimated tokens (tools.read_file.max_tokens) on a line boundary with a continuation offset. An absolute ~100K-character ceiling also applies. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
-            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000)", "default": 500, "maximum": 2000}
+            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000). Omit to also apply the default token budget.", "default": 500, "maximum": 2000}
         },
         "required": ["path"]
     }
@@ -2116,12 +2161,16 @@ def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
     token = set_session_id(kw.get("session_id"))
     try:
-        return read_file_tool(
-            path=args.get("path", ""),
-            offset=args.get("offset", 1),
-            limit=args.get("limit", 500),
-            task_id=tid,
-        )
+        read_kwargs = {
+            "path": args.get("path", ""),
+            "offset": args.get("offset", 1),
+            "task_id": tid,
+        }
+        # Only forward limit when the caller set it — omission triggers the
+        # default token budget in read_file_tool.
+        if "limit" in args:
+            read_kwargs["limit"] = args.get("limit")
+        return read_file_tool(**read_kwargs)
     except SessionFsJailError as exc:
         return tool_error(str(exc))
     finally:

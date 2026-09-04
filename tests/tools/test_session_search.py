@@ -638,3 +638,68 @@ class TestCronDemotion:
         # Interactive rows first, in original relative order; cron last, in
         # original relative order.
         assert [r["id"] for r in ordered] == [2, 4, 5, 1, 3]
+
+
+# =========================================================================
+# Token budgets
+# =========================================================================
+
+class TestSessionSearchTokenCaps:
+    def setup_method(self):
+        from tools.token_budget import reset_token_budget_caches
+        reset_token_budget_caches()
+
+    def teardown_method(self):
+        from tools.token_budget import reset_token_budget_caches
+        reset_token_budget_caches()
+
+    def test_snippet_capped_at_800_tokens(self, monkeypatch):
+        from tools import session_search_tool as sst
+        from tools.token_budget import estimate_tokens
+
+        monkeypatch.setattr(
+            "tools.token_budget.get_session_search_max_tokens",
+            lambda: 50_000,
+        )
+        huge = "سلام" * 5000  # ~10k tokens at arabic/2
+        payload = {
+            "success": True,
+            "mode": "discover",
+            "query": "x",
+            "results": [{"session_id": "s1", "snippet": huge, "messages": []}],
+            "count": 1,
+        }
+        out = json.loads(sst._dumps_capped(payload))
+        snippet = out["results"][0]["snippet"]
+        assert estimate_tokens(snippet) <= 850  # 800 + ellipsis slack
+        assert len(snippet) < len(huge)
+
+    def test_total_payload_capped(self, monkeypatch):
+        from tools import session_search_tool as sst
+        from tools.token_budget import estimate_tokens
+
+        monkeypatch.setattr(
+            "tools.token_budget.get_session_search_max_tokens",
+            lambda: 200,
+        )
+        results = []
+        for i in range(20):
+            results.append({
+                "session_id": f"s{i}",
+                "snippet": "match",
+                "messages": [
+                    {"id": j, "role": "user", "content": "hello world " * 40}
+                    for j in range(5)
+                ],
+            })
+        payload = {
+            "success": True,
+            "mode": "discover",
+            "query": "x",
+            "results": results,
+            "count": len(results),
+        }
+        out = json.loads(sst._dumps_capped(payload))
+        assert out.get("truncated") is True
+        assert out["count"] < 20
+        assert estimate_tokens(json.dumps(out, ensure_ascii=False)) <= 250

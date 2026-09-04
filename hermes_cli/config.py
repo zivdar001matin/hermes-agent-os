@@ -1188,6 +1188,12 @@ DEFAULT_CONFIG = {
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
         "disabled_toolsets": [],
+        # Drop individual tools by name after toolset resolution (before
+        # schemas are serialized). Use when a toolset is too coarse
+        # (e.g. drop ``patch`` without losing ``read_file``/``write_file``).
+        # Native tool names only — MCP tools belong under
+        # ``mcp_servers.<name>.tools.exclude``.
+        "excluded_tools": [],
 
         # Per-model reasoning effort overrides (spelling-tolerant).
         # Dict mapping model names (any reasonable spelling) to effort levels.
@@ -1489,6 +1495,14 @@ DEFAULT_CONFIG = {
                                       # Default False matches historical behavior; set to
                                       # True if you'd rather pause than silently lose
                                       # context turns when your aux model is flaky.
+        # Cap on the timeout-failure cooldown ladder (60s → 300s → 900s).
+        # Per compression *call*, never a mission/widget wall-clock limit.
+        "failure_cooldown_max": 900,
+        # Optional absolute trigger cap. When set, agent_init.py takes
+        # min(ratio_derived_threshold_tokens, threshold_tokens). The ratio
+        # scales with the window; the absolute cap does not — omit it unless
+        # you have a measured token budget. Defined here only as documentation;
+        # DEFAULT_CONFIG leaves it unset so the ratio wins on its own.
         "codex_gpt55_autoraise": True,  # Historical key name kept for compatibility.
                                       # When True, gpt-5.4 / gpt-5.5 / gpt-5.6 on the
                                       # ChatGPT Codex OAuth route raise their compaction
@@ -1627,6 +1641,11 @@ DEFAULT_CONFIG = {
         # not a meaningful recovery, so an unretried blip silently loses the
         # call.
         "transient_retries": 2,
+        # When any single tool result exceeds this many estimated tokens
+        # (estimate_tokens_rough), summarize it on the auxiliary model before
+        # the main model sees it again. Independent of simple_tools allowlist.
+        # Set to 0 to disable. Default 6000.
+        "large_result_threshold_tokens": 6000,
         "vision": {
             "provider": "auto",    # auto | openrouter | nous | codex | custom
             "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"
@@ -2462,6 +2481,10 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # When non-empty, only these skill names appear in the
+        # <available_skills> system-prompt index. All installed skills
+        # remain loadable via skill_view(name).
+        "index_allowlist": [],
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
@@ -2968,6 +2991,18 @@ DEFAULT_CONFIG = {
             # Hard upper bound the model can request via ``limit``. Range 1..50.
             "max_search_limit": 20,
         },
+        # Default result budgets (estimated tokens via estimate_tokens_rough).
+        # Applied when the caller omits an explicit line ``limit`` on read_file,
+        # and always for session_search payloads (snippets capped at 800).
+        "read_file": {
+            "max_tokens": 4000,
+        },
+        "session_search": {
+            "max_tokens": 4000,
+        },
+        # Replace identical tool results in a session with a short pointer
+        # to the earlier message instead of appending the full payload again.
+        "dedupe_results": True,
     },
 
     # Logging — controls file logging to ~/.hermes/logs/.

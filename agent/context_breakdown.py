@@ -1,9 +1,8 @@
 """Live session context-window breakdown for UI surfaces.
 
 Estimates how the next provider request is composed: system prompt tiers,
-tool schemas, and conversation history. Uses the same rough char/4 heuristic
-as ``agent.model_metadata.estimate_request_tokens_rough`` so numbers align
-with compression thresholds — not exact tokenizer counts.
+tool schemas, and conversation history. Uses ``agent.model_metadata`` token
+estimates so numbers align with compression thresholds.
 """
 
 from __future__ import annotations
@@ -29,9 +28,9 @@ _CATEGORY_COLORS = {
 
 
 def _chars_to_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return (len(text) + 3) // 4
+    from agent.model_metadata import estimate_tokens_rough
+
+    return estimate_tokens_rough(text)
 
 
 def _json_tokens(value: Any) -> int:

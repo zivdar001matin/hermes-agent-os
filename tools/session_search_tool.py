@@ -254,7 +254,7 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
             f"Session has {total} messages; showing first {head} + last {tail}. "
             "Pass around_message_id (any id above) to scroll the middle."
         )
-    return json.dumps(response, ensure_ascii=False)
+    return _dumps_capped(response)
 
 
 def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
@@ -288,13 +288,13 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
             if len(results) >= limit:
                 break
 
-        return json.dumps({
+        return _dumps_capped({
             "success": True,
             "mode": "browse",
             "results": results,
             "count": len(results),
             "message": f"Showing {len(results)} most recent sessions. Pass a query= to search, or session_id+around_message_id to scroll.",
-        }, ensure_ascii=False)
+        })
     except Exception as e:
         logging.error("Error listing recent sessions: %s", e, exc_info=True)
         return tool_error(f"Failed to list recent sessions: {e}", success=False)
@@ -421,7 +421,7 @@ def _scroll(
     }
     if rebind_warning:
         response["warning"] = rebind_warning
-    return json.dumps(response, ensure_ascii=False)
+    return _dumps_capped(response)
 
 
 def _normalize_title_query(query: str) -> str:
@@ -531,14 +531,14 @@ def _discover(
     raw_results = _order_for_recall(raw_results)
 
     if not raw_results and not title_result:
-        return json.dumps({
+        return _dumps_capped({
             "success": True,
             "mode": "discover",
             "query": query,
             "results": [],
             "count": 0,
             "message": "No matching sessions found.",
-        }, ensure_ascii=False)
+        })
 
     # Dedupe by lineage. Keep the raw owning session_id on the surviving
     # row — only that pairs validly with the FTS5 match id for the anchored
@@ -606,14 +606,81 @@ def _discover(
             entry["parent_session_id"] = lineage_root
         results.append(entry)
 
-    return json.dumps({
+    return _dumps_capped({
         "success": True,
         "mode": "discover",
         "query": query,
         "results": results,
         "count": len(results),
         "sessions_searched": len(seen_sessions),
-    }, ensure_ascii=False)
+    })
+
+
+def _truncate_snippet(snippet: str, max_tokens: int) -> str:
+    from tools.token_budget import truncate_text_to_tokens
+
+    trimmed, _ = truncate_text_to_tokens(snippet or "", max_tokens)
+    return trimmed
+
+
+def _apply_session_search_token_caps(payload: dict) -> dict:
+    """Cap snippets and total payload size for session_search responses.
+
+    Search output is for locating content, not reading it whole:
+    - each ``snippet`` ≤ 800 estimated tokens
+    - whole JSON payload ≤ ``tools.session_search.max_tokens`` (default 4000)
+    """
+    from tools.token_budget import (
+        DEFAULT_SESSION_SEARCH_SNIPPET_MAX_TOKENS,
+        estimate_tokens,
+        get_session_search_max_tokens,
+        truncate_text_to_tokens,
+    )
+
+    max_total = get_session_search_max_tokens()
+    max_snippet = DEFAULT_SESSION_SEARCH_SNIPPET_MAX_TOKENS
+
+    def _cap_message_list(messages):
+        if not isinstance(messages, list):
+            return
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str) and content:
+                msg["content"], _ = truncate_text_to_tokens(content, max_snippet)
+
+    results = payload.get("results")
+    if isinstance(results, list):
+        for entry in results:
+            if not isinstance(entry, dict):
+                continue
+            if "snippet" in entry and isinstance(entry.get("snippet"), str):
+                entry["snippet"] = _truncate_snippet(entry["snippet"], max_snippet)
+            for key in ("messages", "bookend_start", "bookend_end"):
+                _cap_message_list(entry.get(key))
+
+        while results and estimate_tokens(json.dumps(payload, ensure_ascii=False)) > max_total:
+            results.pop()
+            payload["count"] = len(results)
+            payload["truncated"] = True
+            payload["truncation_reason"] = "token_budget"
+
+    # Scroll / read shapes carry a flat messages list.
+    _cap_message_list(payload.get("messages"))
+    if estimate_tokens(json.dumps(payload, ensure_ascii=False)) > max_total:
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            while messages and estimate_tokens(json.dumps(payload, ensure_ascii=False)) > max_total:
+                messages.pop()
+            payload["truncated"] = True
+            payload["truncation_reason"] = "token_budget"
+
+    return payload
+
+
+def _dumps_capped(payload: dict) -> str:
+    return json.dumps(_apply_session_search_token_caps(payload), ensure_ascii=False)
 
 
 def session_search(
@@ -703,7 +770,7 @@ def session_search(
                 located.close()
             if found.get("success"):
                 found["profile"] = owner
-                return json.dumps(found, ensure_ascii=False)
+                return _dumps_capped(found)
         return result
 
     # Limit clamp [1, 10]
