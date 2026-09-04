@@ -11,6 +11,11 @@ loop on the auxiliary model with a compact prompt (the 4B aux window is
 much smaller than the main 27B context). Extra assistant+tool messages are
 appended to the live transcript so the main model sees the gather trail on
 its next turn. Failures are swallowed — the main loop always continues.
+
+Independently, any single tool result whose estimated size exceeds
+``auxiliary.large_result_threshold_tokens`` (default 6000) is summarized
+by the aux model *in place* before the main model sees it again, with a
+note that the full result is available via a narrower re-call.
 """
 
 from __future__ import annotations
@@ -41,6 +46,8 @@ DEFAULT_SIMPLE_TOOLS = frozenset({
     "list_available_files",
     "list_buckets",
     "find_files",
+    "memory",
+    "todo",
 })
 
 _MAX_ITERATIONS_DEFAULT = 4
@@ -49,6 +56,11 @@ _USER_REQUEST_CHARS = 2000
 _TOOL_RESULT_CHARS = 2500
 _AUX_NOTE_CHARS = 1500
 _AUX_OUTPUT_TOKENS = 1024
+DEFAULT_LARGE_RESULT_THRESHOLD_TOKENS = 6000
+# Cap how much of an oversized result we send to the aux summarizer so a
+# 4B / small-window endpoint is not blown out by a single dump.
+_LARGE_RESULT_AUX_INPUT_TOKENS = 12_000
+_LARGE_RESULT_MARKER = "[Full tool result was"
 
 _SYSTEM_PROMPT = (
     "You are a fast auxiliary gatherer for a larger coding agent. "
@@ -372,6 +384,227 @@ def _build_seed_messages(
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": user},
     ]
+
+
+# ---------------------------------------------------------------------------
+# Large tool-result summarization (independent of the simple-tools allowlist)
+# ---------------------------------------------------------------------------
+
+_SUMMARIZE_SYSTEM = (
+    "You summarize oversized tool results for a larger coding agent. "
+    "Preserve concrete facts: paths, identifiers, errors, signatures, and "
+    "structure. Drop repetition and boilerplate. Reply with the summary only "
+    "— no preamble, no tools."
+)
+
+
+def large_result_threshold_tokens() -> int:
+    """Return ``auxiliary.large_result_threshold_tokens`` (default 6000).
+
+    Values ``<= 0`` disable large-result summarization.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        aux = (load_config() or {}).get("auxiliary")
+        if not isinstance(aux, dict):
+            return DEFAULT_LARGE_RESULT_THRESHOLD_TOKENS
+        raw = aux.get(
+            "large_result_threshold_tokens", DEFAULT_LARGE_RESULT_THRESHOLD_TOKENS
+        )
+        if raw is None:
+            return DEFAULT_LARGE_RESULT_THRESHOLD_TOKENS
+        value = int(raw)
+    except Exception:
+        return DEFAULT_LARGE_RESULT_THRESHOLD_TOKENS
+    return value
+
+
+def _estimate_tokens(text: str) -> int:
+    from agent.model_metadata import estimate_tokens_rough
+
+    return estimate_tokens_rough(text or "")
+
+
+def _head_tail_for_aux(text: str, max_tokens: int) -> str:
+    """Fit *text* into *max_tokens* for the aux summarizer (head + tail)."""
+    if _estimate_tokens(text) <= max_tokens:
+        return text
+    # Approximate char budget from script-aware density; prefer overshooting
+    # slightly then trim with a binary search on the joined string.
+    half = max(500, max_tokens // 2)
+    # Start with generous char slices, then shrink until the whole payload fits.
+    head_chars = half * 4
+    tail_chars = half * 4
+    while head_chars > 200 or tail_chars > 200:
+        candidate = (
+            text[:head_chars]
+            + "\n\n…[middle omitted for auxiliary summarization]…\n\n"
+            + text[-tail_chars:]
+        )
+        if _estimate_tokens(candidate) <= max_tokens:
+            return candidate
+        head_chars = max(200, int(head_chars * 0.7))
+        tail_chars = max(200, int(tail_chars * 0.7))
+    return text[:800] + "\n…\n" + text[-800:]
+
+
+def _resolve_large_result_task(agent: Any) -> Optional[str]:
+    """Pick an aux task with a distinct endpoint for summarization."""
+    simple_cfg = _task_config()
+    if _is_truthy(simple_cfg.get("enabled")) and _aux_endpoint_is_distinct(
+        agent, simple_cfg
+    ):
+        return TASK_KEY
+    try:
+        from agent.auxiliary_client import _get_auxiliary_task_config
+
+        comp = _get_auxiliary_task_config("compression")
+    except Exception:
+        comp = {}
+    if isinstance(comp, dict) and _aux_endpoint_is_distinct(agent, comp):
+        return "compression"
+    return None
+
+
+def _batch_tool_messages(
+    messages: Sequence[Dict[str, Any]],
+    tool_calls: Sequence[Any],
+) -> List[Dict[str, Any]]:
+    wanted_ids = {
+        str(getattr(tc, "id", "") or "").strip()
+        for tc in (tool_calls or [])
+        if str(getattr(tc, "id", "") or "").strip()
+    }
+    out: List[Dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        if msg.get("_aux_large_result_summary"):
+            continue
+        call_id = str(msg.get("tool_call_id") or "").strip()
+        if wanted_ids and call_id and call_id not in wanted_ids:
+            continue
+        out.append(msg)
+    return out
+
+
+def _replace_tool_content(msg: Dict[str, Any], new_text: str) -> None:
+    content = msg.get("content")
+    if isinstance(content, dict) and content.get("_multimodal"):
+        content["text_summary"] = new_text
+        return
+    msg["content"] = new_text
+
+
+def _summarize_one_large_result(
+    *,
+    task: str,
+    tool_name: str,
+    body: str,
+    token_count: int,
+) -> Optional[str]:
+    from agent.auxiliary_client import call_llm
+
+    payload = _head_tail_for_aux(body, _LARGE_RESULT_AUX_INPUT_TOKENS)
+    try:
+        response = call_llm(
+            task=task,
+            messages=[
+                {"role": "system", "content": _SUMMARIZE_SYSTEM},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Tool `{tool_name}` returned a large result "
+                        f"(~{token_count} estimated tokens). Summarize it:\n\n"
+                        f"{payload}"
+                    ),
+                },
+            ],
+            temperature=0,
+            max_tokens=_AUX_OUTPUT_TOKENS,
+        )
+    except Exception as exc:
+        logger.info("auxiliary large-result summary failed: %s", exc)
+        return None
+    summary = _response_text(response).strip()
+    return summary or None
+
+
+def maybe_summarize_large_tool_results(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    assistant_message: Any,
+) -> int:
+    """Summarize oversized tool results via aux before the main model continues.
+
+    Independent of the simple-tools allowlist: any tool whose result exceeds
+    ``auxiliary.large_result_threshold_tokens`` is rewritten in place with an
+    aux summary plus a note to re-call with narrower arguments.
+
+    Returns the number of tool messages rewritten.
+    """
+    if getattr(agent, "_in_aux_simple_tools", False):
+        return 0
+    if getattr(agent, "_interrupt_requested", False):
+        return 0
+
+    threshold = large_result_threshold_tokens()
+    if threshold <= 0:
+        return 0
+
+    task = _resolve_large_result_task(agent)
+    if not task:
+        return 0
+
+    tool_calls = getattr(assistant_message, "tool_calls", None) or []
+    batch = _batch_tool_messages(messages, tool_calls)
+    if not batch:
+        return 0
+
+    rewritten = 0
+    _vprint = getattr(agent, "_vprint", None)
+    prefix = getattr(agent, "log_prefix", "") or ""
+
+    for msg in batch:
+        content = msg.get("content")
+        if isinstance(content, dict) and content.get("_multimodal"):
+            # Screenshots / binary blobs are not text-summarizable here.
+            continue
+        body = _message_text(msg)
+        if not body or _LARGE_RESULT_MARKER in body:
+            continue
+        tokens = _estimate_tokens(body)
+        if tokens < threshold:
+            continue
+
+        tool_name = str(msg.get("name") or "tool")
+        if callable(_vprint) and not getattr(agent, "quiet_mode", False):
+            _vprint(
+                f"{prefix}⚡ Auxiliary summarizing large {tool_name} result "
+                f"(~{tokens} tokens)..."
+            )
+
+        summary = _summarize_one_large_result(
+            task=task,
+            tool_name=tool_name,
+            body=body,
+            token_count=tokens,
+        )
+        if not summary:
+            continue
+
+        note = (
+            f"{_LARGE_RESULT_MARKER} ~{tokens} estimated tokens and was "
+            "summarized by the auxiliary model. Re-call this tool with narrower "
+            "arguments (e.g. offset/limit, a tighter path or query) if you need "
+            "more of the original content.]"
+        )
+        _replace_tool_content(msg, f"{summary}\n\n{note}")
+        msg["_aux_large_result_summary"] = True
+        rewritten += 1
+
+    return rewritten
 
 
 def maybe_run_aux_simple_tool_followup(
