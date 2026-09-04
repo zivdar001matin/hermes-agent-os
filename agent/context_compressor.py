@@ -290,6 +290,28 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+_DEFAULT_FAILURE_COOLDOWN_MAX = 900
+_TIMEOUT_COOLDOWN_LADDER = (60, 300, 900)
+
+
+def _compression_failure_cooldown_max() -> int:
+    """Return ``compression.failure_cooldown_max`` (default 900).
+
+    Caps the timeout-failure ladder (60s → 300s → 900s). This is a per
+    compression-call cooldown, never a mission/widget duration limit.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        raw = ((load_config() or {}).get("compression") or {}).get(
+            "failure_cooldown_max", _DEFAULT_FAILURE_COOLDOWN_MAX
+        )
+        if raw is None:
+            return _DEFAULT_FAILURE_COOLDOWN_MAX
+        value = int(raw)
+    except Exception:
+        return _DEFAULT_FAILURE_COOLDOWN_MAX
+    return value if value > 0 else _DEFAULT_FAILURE_COOLDOWN_MAX
 
 # Hard ceiling for the deterministic summary-failure handoff.  The fallback is
 # only meant to preserve continuity anchors from the dropped window, not to
@@ -2571,8 +2593,10 @@ This compaction should PRIORITISE preserving all information related to the focu
             # summary route can produce within its deadline will fail the
             # same way every time, and re-burning the full timeout every
             # 60s turns each subsequent turn into a multi-minute stall
-            # (#62452). 60s → 300s → 900s (capped); any successful summary
-            # resets the streak via _clear_compression_failure_cooldown().
+            # (#62452). 60s → 300s → 900s (capped by
+            # ``compression.failure_cooldown_max``, default 900; OS seed uses
+            # 120). Any successful summary resets the streak via
+            # _clear_compression_failure_cooldown().
             # Timeout takes precedence over the streaming-closed short rung:
             # a "timed out" error also matches _is_connection_error, but a
             # deadline exhaustion is the structural repeat-offender class,
@@ -2581,11 +2605,13 @@ This compaction should PRIORITISE preserving all information related to the focu
                 self._consecutive_timeout_failures = (
                     getattr(self, "_consecutive_timeout_failures", 0) + 1
                 )
-                _TIMEOUT_COOLDOWN_LADDER = (60, 300, 900)
                 _transient_cooldown = _TIMEOUT_COOLDOWN_LADDER[
                     min(self._consecutive_timeout_failures,
                         len(_TIMEOUT_COOLDOWN_LADDER)) - 1
                 ]
+                _transient_cooldown = min(
+                    _transient_cooldown, _compression_failure_cooldown_max()
+                )
             elif _is_json_decode or _is_streaming_closed:
                 _transient_cooldown = 30
             else:

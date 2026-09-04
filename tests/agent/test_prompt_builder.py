@@ -561,6 +561,28 @@ class TestBuildSkillsSystemPrompt:
         assert "web-search" in result
         assert "old-tool" not in result
 
+    def test_index_allowlist_limits_available_skills(self, monkeypatch, tmp_path):
+        """Allowlisted skills only appear in the index; others stay loadable."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for name in ("hermes-agent", "pr-review", "tweet-stuff"):
+            d = tmp_path / "skills" / "tools" / name
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: Does {name}\n---\n"
+            )
+
+        from unittest.mock import patch
+
+        with patch(
+            "agent.prompt_builder.get_skills_index_allowlist",
+            return_value={"hermes-agent", "pr-review"},
+        ):
+            result = build_skills_system_prompt()
+
+        assert "hermes-agent" in result
+        assert "pr-review" in result
+        assert "tweet-stuff" not in result
+
     def test_rebuilds_prompt_when_disabled_skills_change(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         skill_dir = tmp_path / "skills" / "tools" / "cached-skill"

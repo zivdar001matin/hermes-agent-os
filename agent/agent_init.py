@@ -1924,6 +1924,11 @@ def init_agent(
             max_tokens=agent.max_tokens,
         )
     _compression_threshold_tokens = _compression_cfg.get("threshold_tokens")
+    # When both `compression.threshold` (ratio) and `compression.threshold_tokens`
+    # (absolute) are set, the absolute key is an UPPER CAP:
+    #   threshold_tokens = min(ratio_derived, cap)
+    # The ratio scales with the window; the cap does not. Prefer omitting
+    # threshold_tokens so the ratio wins on its own.
     if _compression_threshold_tokens is not None:
         try:
             _cap = int(_compression_threshold_tokens)

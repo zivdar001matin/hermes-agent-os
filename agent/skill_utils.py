@@ -404,6 +404,36 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     return global_disabled
 
 
+def get_skills_index_allowlist() -> Set[str] | None:
+    """Return configured index allowlist, or None when filtering is off.
+
+    ``skills.index_allowlist`` limits which skills appear in the
+    ``<available_skills>`` system-prompt block. An absent or empty list
+    means no filtering (all eligible skills are indexed).
+    """
+    parsed = _load_raw_config()
+    if not parsed:
+        return None
+
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return None
+
+    allowlist = _normalize_string_set(skills_cfg.get("index_allowlist"))
+    return allowlist or None
+
+
+def skill_passes_index_allowlist(
+    frontmatter_name: str,
+    skill_name: str,
+    allowlist: Set[str] | None,
+) -> bool:
+    """Return True if the skill should appear in the index allowlist filter."""
+    if not allowlist:
+        return True
+    return frontmatter_name in allowlist or skill_name in allowlist
+
+
 def _normalize_string_set(values) -> Set[str]:
     if values is None:
         return set()

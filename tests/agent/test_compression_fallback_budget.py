@@ -162,6 +162,21 @@ def test_timeout_cooldown_escalates_and_caps():
     assert c._summary_failure_cooldown_until == 4000.0 + 900
 
 
+def test_timeout_cooldown_respects_failure_cooldown_max(monkeypatch):
+    """compression.failure_cooldown_max clamps the 60→300→900 ladder."""
+    monkeypatch.setattr(
+        "agent.context_compressor._compression_failure_cooldown_max",
+        lambda: 120,
+    )
+    c = _make_compressor()
+    assert _fail_with_timeout(c, 1000.0) is None
+    assert c._summary_failure_cooldown_until == 1000.0 + 60
+    assert _fail_with_timeout(c, 2000.0) is None
+    assert c._summary_failure_cooldown_until == 2000.0 + 120
+    assert _fail_with_timeout(c, 3000.0) is None
+    assert c._summary_failure_cooldown_until == 3000.0 + 120
+
+
 def test_timeout_streak_resets_on_success():
     c = _make_compressor()
     assert _fail_with_timeout(c, 1000.0) is None
