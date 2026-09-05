@@ -6359,3 +6359,101 @@ class TestLoneSurrogatePersistence:
         assert db.set_session_title("s1", "title \ud835 bad") is True
         assert db.get_session("s1")["title"] == "title \ufffd bad"
 
+
+# =========================================================================
+# Per-call telemetry (api_calls / tool_results)
+# =========================================================================
+
+class TestApiCallTelemetry:
+    def test_record_api_call_increments_index(self, db):
+        db.create_session("s1", source="api_server")
+        i1 = db.record_api_call(
+            "s1", model="qwen", base_url="http://host:9931/v1",
+            started_at=100.0, finished_at=110.0,
+            prompt_tokens=2000, completion_tokens=80, cached_tokens=500,
+            estimated_prompt_tokens=2100, finish_reason="tool_calls",
+            tool_names=["read_file"],
+        )
+        i2 = db.record_api_call(
+            "s1", model="qwen", base_url="http://host:9931/v1",
+            started_at=110.0, finished_at=237.0,
+            prompt_tokens=4000, completion_tokens=40, cached_tokens=2000,
+            estimated_prompt_tokens=3900, finish_reason="stop",
+        )
+        assert i1 == 1
+        assert i2 == 2
+        rows = db._conn.execute(
+            "SELECT call_index, prompt_tokens, estimated_prompt_tokens, finish_reason, tool_names, finished_at "
+            "FROM api_calls WHERE session_id = 's1' ORDER BY call_index"
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[0]["call_index"] == 1
+        assert rows[0]["prompt_tokens"] == 2000
+        assert rows[0]["estimated_prompt_tokens"] == 2100
+        assert json.loads(rows[0]["tool_names"]) == ["read_file"]
+        assert rows[1]["finished_at"] == 237.0
+
+    def test_record_api_call_stores_request_id(self, db):
+        db.create_session("s1", source="api_server")
+        db.record_api_call(
+            "s1", model="qwen", call_index=1,
+            started_at=1, finished_at=2, request_id="mhndsi:s1:1",
+        )
+        row = db._conn.execute("SELECT request_id FROM api_calls").fetchone()
+        assert row["request_id"] == "mhndsi:s1:1"
+
+    def test_record_api_call_upsert_is_idempotent(self, db):
+        db.create_session("s1", source="cli")
+        db.record_api_call(
+            "s1", model="qwen", call_index=1,
+            started_at=1, finished_at=2, prompt_tokens=10, completion_tokens=1,
+        )
+        db.record_api_call(
+            "s1", model="qwen", call_index=1,
+            started_at=1, finished_at=2, prompt_tokens=10, completion_tokens=1,
+        )
+        n = db._conn.execute("SELECT COUNT(*) FROM api_calls WHERE session_id = 's1'").fetchone()[0]
+        assert n == 1
+
+    def test_record_tool_result(self, db):
+        db.create_session("s1", source="cli")
+        db.record_api_call("s1", model="qwen", started_at=1, finished_at=2, prompt_tokens=10)
+        db.record_tool_result(
+            "s1", "read_file", result_chars=43000, result_est_tokens=12000,
+            duration_ms=50, routed_to="main", truncated=True, deduped=False,
+        )
+        row = db._conn.execute(
+            "SELECT tool_name, result_chars, truncated, deduped, call_index, routed_to "
+            "FROM tool_results WHERE session_id = 's1'"
+        ).fetchone()
+        assert row["tool_name"] == "read_file"
+        assert row["result_chars"] == 43000
+        assert row["truncated"] == 1
+        assert row["deduped"] == 0
+        assert row["call_index"] == 1
+        assert row["routed_to"] == "main"
+
+    def test_set_session_surface(self, db):
+        db.create_session("s1", source="api_server", surface="chat")
+        assert db.get_session("s1")["surface"] == "chat"
+        db.set_session_surface("s1", "mission")
+        # first-write wins
+        assert db.get_session("s1")["surface"] == "chat"
+
+    def test_auxiliary_usage_writes_api_calls_row(self, db):
+        db.create_session("s1", source="cli")
+        db.record_auxiliary_usage(
+            "s1", "compression", model="aux-4b",
+            billing_base_url="http://host:9932/v1",
+            input_tokens=800, output_tokens=40,
+        )
+        row = db._conn.execute(
+            "SELECT task, model, base_url, prompt_tokens, completion_tokens "
+            "FROM api_calls WHERE session_id = 's1'"
+        ).fetchone()
+        assert row["task"] == "compression"
+        assert row["model"] == "aux-4b"
+        assert row["base_url"] == "http://host:9932/v1"
+        assert row["prompt_tokens"] == 800
+        assert row["completion_tokens"] == 40
+

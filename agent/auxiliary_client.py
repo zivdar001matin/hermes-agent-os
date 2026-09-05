@@ -6796,6 +6796,13 @@ def _build_call_kwargs(
         ):
             kwargs["_reasoning_config"] = dict(reasoning_config)
 
+    try:
+        from agent.aux_accounting import stamp_aux_request_header
+
+        stamp_aux_request_header(kwargs)
+    except Exception:
+        pass
+
     return kwargs
 
 

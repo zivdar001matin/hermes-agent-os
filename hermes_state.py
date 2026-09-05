@@ -152,7 +152,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -806,6 +806,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     profile_name TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
+    surface TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -853,6 +854,40 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     first_seen REAL,
     last_seen REAL,
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
+);
+
+CREATE TABLE IF NOT EXISTS api_calls (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          TEXT NOT NULL REFERENCES sessions(id),
+    call_index          INTEGER NOT NULL,
+    model               TEXT NOT NULL,
+    base_url            TEXT,
+    task                TEXT,
+    started_at          REAL NOT NULL,
+    finished_at         REAL NOT NULL,
+    prompt_tokens       INTEGER,
+    completion_tokens   INTEGER,
+    cached_tokens       INTEGER,
+    estimated_prompt_tokens INTEGER,
+    finish_reason       TEXT,
+    tool_names          TEXT,
+    error               TEXT,
+    request_id          TEXT,
+    UNIQUE(session_id, call_index)
+);
+
+CREATE TABLE IF NOT EXISTS tool_results (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL REFERENCES sessions(id),
+    call_index      INTEGER,
+    tool_name       TEXT NOT NULL,
+    result_chars    INTEGER,
+    result_est_tokens INTEGER,
+    duration_ms     INTEGER,
+    routed_to       TEXT,
+    truncated       INTEGER DEFAULT 0,
+    deduped         INTEGER DEFAULT 0,
+    timestamp       REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS state_meta (
@@ -904,6 +939,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestam
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+CREATE INDEX IF NOT EXISTS idx_api_calls_session ON api_calls(session_id, call_index);
+CREATE INDEX IF NOT EXISTS idx_tool_results_session ON tool_results(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
 """
@@ -923,6 +960,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
+CREATE INDEX IF NOT EXISTS idx_api_calls_request_id
+    ON api_calls(request_id);
 """
 
 FTS_SQL = """
@@ -1952,6 +1991,7 @@ class SessionDB:
         parent_session_id: str = None,
         cwd: str = None,
         profile_name: str = None,
+        surface: str = None,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -1975,9 +2015,10 @@ class SessionDB:
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
-                   model, model_config, system_prompt, parent_session_id, cwd, profile_name, started_at
+                   model, model_config, system_prompt, parent_session_id, cwd, profile_name,
+                   surface, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = COALESCE(sessions.model_config, excluded.model_config),
@@ -1988,7 +2029,8 @@ class SessionDB:
                        thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
                        parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
                        cwd = COALESCE(sessions.cwd, excluded.cwd),
-                       profile_name = COALESCE(sessions.profile_name, excluded.profile_name)""",
+                       profile_name = COALESCE(sessions.profile_name, excluded.profile_name),
+                       surface = COALESCE(sessions.surface, excluded.surface)""",
                 (
                     session_id,
                     source,
@@ -2003,6 +2045,7 @@ class SessionDB:
                     parent_session_id,
                     cwd,
                     profile_name,
+                    surface,
                     time.time(),
                 ),
             )
@@ -3134,6 +3177,12 @@ class SessionDB:
         cache_write_tokens: int = 0,
         reasoning_tokens: int = 0,
         estimated_cost_usd: Optional[float] = None,
+        started_at: Optional[float] = None,
+        finished_at: Optional[float] = None,
+        estimated_prompt_tokens: Optional[int] = None,
+        finish_reason: Optional[str] = None,
+        error: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> None:
         """Record an auxiliary LLM call's usage against *session_id* (issue #23270).
 
@@ -3178,6 +3227,204 @@ class SessionDB:
                 task=task,
             )
         self._execute_write(_do)
+        try:
+            self.record_api_call(
+                session_id,
+                model=model,
+                base_url=billing_base_url,
+                task=task,
+                started_at=started_at,
+                finished_at=finished_at,
+                prompt_tokens=input_tokens + cache_read_tokens if input_tokens or cache_read_tokens else input_tokens,
+                completion_tokens=output_tokens,
+                cached_tokens=cache_read_tokens,
+                estimated_prompt_tokens=estimated_prompt_tokens,
+                finish_reason=finish_reason,
+                error=error,
+                request_id=request_id,
+            )
+        except Exception:
+            logger.debug("aux api_calls row failed (session=%s)", session_id, exc_info=True)
+
+    def set_session_surface(self, session_id: str, surface: str) -> None:
+        """Set the originating product surface if not already recorded."""
+        if not session_id or not surface:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET surface = COALESCE(surface, ?) WHERE id = ?",
+                (surface, session_id),
+            )
+        self._execute_write(_do)
+
+    def record_api_call(
+        self,
+        session_id: str,
+        *,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        task: str = "",
+        started_at: Optional[float] = None,
+        finished_at: Optional[float] = None,
+        prompt_tokens: Optional[int] = None,
+        completion_tokens: Optional[int] = None,
+        cached_tokens: Optional[int] = None,
+        estimated_prompt_tokens: Optional[int] = None,
+        finish_reason: Optional[str] = None,
+        tool_names: Optional[Any] = None,
+        error: Optional[str] = None,
+        call_index: Optional[int] = None,
+        request_id: Optional[str] = None,
+    ) -> Optional[int]:
+        """Insert one per-API-call usage row. Returns the assigned call_index.
+
+        Best-effort: accounting must not fail the agent loop. Unique on
+        ``(session_id, call_index)`` so a retried write is idempotent.
+        """
+        if not session_id:
+            return None
+        self._insert_session_row(session_id, "unknown", model=model)
+        now = time.time()
+        started = float(started_at) if started_at is not None else now
+        finished = float(finished_at) if finished_at is not None else now
+        names_json = None
+        if tool_names is not None:
+            try:
+                names_json = (
+                    json.dumps(tool_names)
+                    if not isinstance(tool_names, str)
+                    else tool_names
+                )
+            except (TypeError, ValueError):
+                names_json = None
+
+        assigned = {"index": call_index}
+
+        def _do(conn):
+            idx = assigned["index"]
+            if idx is None:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(call_index), 0) FROM api_calls WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                idx = int(row[0] if not isinstance(row, sqlite3.Row) else row[0]) + 1
+                assigned["index"] = idx
+            eff_model = model or "unknown"
+            conn.execute(
+                """INSERT INTO api_calls (
+                       session_id, call_index, model, base_url, task,
+                       started_at, finished_at, prompt_tokens, completion_tokens,
+                       cached_tokens, estimated_prompt_tokens, finish_reason,
+                       tool_names, error, request_id
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id, call_index) DO UPDATE SET
+                       model = excluded.model,
+                       base_url = COALESCE(excluded.base_url, api_calls.base_url),
+                       task = COALESCE(excluded.task, api_calls.task),
+                       started_at = excluded.started_at,
+                       finished_at = excluded.finished_at,
+                       prompt_tokens = COALESCE(excluded.prompt_tokens, api_calls.prompt_tokens),
+                       completion_tokens = COALESCE(excluded.completion_tokens, api_calls.completion_tokens),
+                       cached_tokens = COALESCE(excluded.cached_tokens, api_calls.cached_tokens),
+                       estimated_prompt_tokens = COALESCE(
+                           excluded.estimated_prompt_tokens, api_calls.estimated_prompt_tokens
+                       ),
+                       finish_reason = COALESCE(excluded.finish_reason, api_calls.finish_reason),
+                       tool_names = COALESCE(excluded.tool_names, api_calls.tool_names),
+                       error = COALESCE(excluded.error, api_calls.error),
+                       request_id = COALESCE(excluded.request_id, api_calls.request_id)""",
+                (
+                    session_id,
+                    idx,
+                    eff_model,
+                    base_url,
+                    task or "",
+                    started,
+                    finished,
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens,
+                    estimated_prompt_tokens,
+                    finish_reason,
+                    names_json,
+                    error,
+                    request_id,
+                ),
+            )
+
+        try:
+            self._execute_write(_do)
+        except Exception:
+            logger.debug("record_api_call(%s) failed", session_id, exc_info=True)
+            return None
+        return assigned["index"]
+
+    def next_api_call_index(self, session_id: str) -> int:
+        """Return the next ``call_index`` that ``record_api_call`` would assign."""
+        if not session_id or self._conn is None:
+            return 1
+        try:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(call_index), 0) FROM api_calls WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return int(row[0] if not isinstance(row, sqlite3.Row) else row[0]) + 1
+        except Exception:
+            return 1
+
+    def record_tool_result(
+        self,
+        session_id: str,
+        tool_name: str,
+        *,
+        call_index: Optional[int] = None,
+        result_chars: Optional[int] = None,
+        result_est_tokens: Optional[int] = None,
+        duration_ms: Optional[int] = None,
+        routed_to: Optional[str] = None,
+        truncated: bool = False,
+        deduped: bool = False,
+        timestamp: Optional[float] = None,
+    ) -> None:
+        """Insert one tool-result telemetry row. Best-effort."""
+        if not session_id or not tool_name:
+            return
+        self._insert_session_row(session_id, "unknown")
+        ts = float(timestamp) if timestamp is not None else time.time()
+
+        def _do(conn):
+            idx = call_index
+            if idx is None:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(call_index), 0) FROM api_calls WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                idx = int(row[0] if not isinstance(row, sqlite3.Row) else row[0]) or None
+            conn.execute(
+                """INSERT INTO tool_results (
+                       session_id, call_index, tool_name, result_chars,
+                       result_est_tokens, duration_ms, routed_to, truncated,
+                       deduped, timestamp
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    idx,
+                    tool_name,
+                    result_chars,
+                    result_est_tokens,
+                    duration_ms,
+                    routed_to,
+                    1 if truncated else 0,
+                    1 if deduped else 0,
+                    ts,
+                ),
+            )
+
+        try:
+            self._execute_write(_do)
+        except Exception:
+            logger.debug("record_tool_result(%s, %s) failed", session_id, tool_name, exc_info=True)
 
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
         """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""

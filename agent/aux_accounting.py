@@ -37,6 +37,11 @@ _accounting: ContextVar[Optional[tuple]] = ContextVar(
     "aux_accounting_context", default=None
 )
 
+# Request id stamped onto the in-flight aux HTTP call, if any.
+_request_id: ContextVar[Optional[str]] = ContextVar(
+    "aux_telemetry_request_id", default=None
+)
+
 # Aux tasks whose usage is already accounted by the main loop — recording
 # them here would double-count. MoA advisor/aggregator usage is folded into
 # conversation_loop's update_token_counts delta (tokens AND cost).
@@ -66,6 +71,30 @@ def reset_accounting_context(token) -> None:
 def get_accounting_context() -> Optional[tuple]:
     """Return ``(session_db, session_id)`` for the active turn, or ``None``."""
     return _accounting.get()
+
+
+def stamp_aux_request_header(kwargs: dict) -> Optional[str]:
+    """Attach ``X-Hermes-Request`` when an accounting context is published."""
+    ctx = _accounting.get()
+    if ctx is None or not isinstance(kwargs, dict):
+        return None
+    session_db, session_id = ctx
+    try:
+        from agent.telemetry_headers import attach_hermes_request_header, build_hermes_request_id
+
+        request_id, _idx = build_hermes_request_id(session_db, session_id)
+        attach_hermes_request_header(kwargs, request_id)
+        _request_id.set(request_id)
+        return request_id
+    except Exception:
+        logger.debug("aux X-Hermes-Request stamp failed", exc_info=True)
+        return None
+
+
+def consume_aux_request_id() -> Optional[str]:
+    value = _request_id.get()
+    _request_id.set(None)
+    return value
 
 
 def record_aux_usage(
@@ -133,6 +162,7 @@ def record_aux_usage(
             cache_write_tokens=usage.cache_write_tokens,
             reasoning_tokens=usage.reasoning_tokens,
             estimated_cost_usd=estimated_cost,
+            request_id=consume_aux_request_id(),
         )
     except Exception:
         logger.debug("Aux usage recording failed (non-fatal)", exc_info=True)

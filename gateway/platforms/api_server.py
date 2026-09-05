@@ -2241,7 +2241,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "output_tokens", "cache_read_tokens", "cache_write_tokens",
             "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
             "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id",
+            "_lineage_root_id", "surface",
         )
         payload = {key: session.get(key) for key in safe_keys if key in session}
         # Avoid exposing full system prompts/model_config through the client API;
@@ -2353,6 +2353,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
         title = body.get("title")
+        surface = body.get("surface")
+        if surface is not None and not isinstance(surface, str):
+            return web.json_response(_openai_error("surface must be a string", code="invalid_surface"), status=400)
+        if isinstance(surface, str):
+            surface = surface.strip() or None
+        if surface and surface not in {"chat", "mission", "widget_builder"}:
+            return web.json_response(
+                _openai_error("surface must be chat, mission, or widget_builder", code="invalid_surface"),
+                status=400,
+            )
 
         # Run the entire check-insert-title sequence inside a single
         # _execute_write call (BEGIN IMMEDIATE + commit) so the existence
@@ -2369,13 +2379,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 import time as _time
                 conn.execute(
                     """INSERT INTO sessions (
-                       id, source, model, system_prompt, started_at
-                    ) VALUES (?, ?, ?, ?, ?)""",
+                       id, source, model, system_prompt, surface, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         "api_server",
                         str(model) if model else None,
                         system_prompt,
+                        surface,
                         _time.time(),
                     ),
                 )
@@ -2510,6 +2521,7 @@ class APIServerAdapter(BasePlatformAdapter):
             model=source.get("model"),
             system_prompt=source.get("system_prompt"),
             parent_session_id=source_id,
+            surface=source.get("surface"),
         )
         messages = await asyncio.to_thread(db.get_messages, source_id)
         await asyncio.to_thread(db.replace_messages, fork_id, messages)

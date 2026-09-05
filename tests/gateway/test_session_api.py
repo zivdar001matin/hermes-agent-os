@@ -170,6 +170,29 @@ async def test_session_crud_and_message_history(adapter, session_db):
 
 
 @pytest.mark.asyncio
+async def test_create_session_stores_surface(adapter, session_db):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/sessions",
+            json={"title": "Widget run", "surface": "widget_builder"},
+        )
+        assert resp.status == 201
+        created = await resp.json()
+    session_id = created["session"]["id"]
+    assert created["session"]["surface"] == "widget_builder"
+    assert session_db.get_session(session_id)["surface"] == "widget_builder"
+
+
+@pytest.mark.asyncio
+async def test_create_session_rejects_unknown_surface(adapter):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/api/sessions", json={"title": "x", "surface": "telegram"})
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
 async def test_session_messages_follow_compression_tip(adapter, session_db):
     source_id = session_db.create_session("source-session", "api_server")
     session_db.append_message(source_id, "user", "before compression")

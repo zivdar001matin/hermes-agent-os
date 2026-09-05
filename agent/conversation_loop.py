@@ -204,6 +204,130 @@ def maybe_dedupe_tool_results(
     return rewritten
 
 
+_TELEMETRY_TRUNCATION_MARKERS = (
+    "[truncated at line",
+    "[Full tool result was",
+    "stdout was truncated",
+    "stdout_truncated",
+    "_truncated",
+)
+_TELEMETRY_DEDUP_MARKER = "[duplicate tool result"
+
+
+def _tool_names_from_response(response: Any) -> list:
+    names = []
+    try:
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return names
+        tool_calls = getattr(getattr(choices[0], "message", None), "tool_calls", None) or []
+        for tc in tool_calls:
+            fn = getattr(tc, "function", None)
+            name = getattr(fn, "name", None) if fn is not None else getattr(tc, "name", None)
+            if name:
+                names.append(str(name))
+    except Exception:
+        return names
+    return names
+
+
+def persist_completed_api_call(
+    agent: Any,
+    *,
+    started_at: float,
+    finished_at: float,
+    prompt_tokens: Optional[int] = None,
+    completion_tokens: Optional[int] = None,
+    cached_tokens: Optional[int] = None,
+    estimated_prompt_tokens: Optional[int] = None,
+    finish_reason: Optional[str] = None,
+    tool_names: Optional[list] = None,
+    error: Optional[str] = None,
+    task: str = "",
+) -> None:
+    """Write one ``api_calls`` row after a completed model response."""
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if not session_db or not session_id:
+        return
+    try:
+        session_db.record_api_call(
+            session_id,
+            model=getattr(agent, "model", None) or "unknown",
+            base_url=getattr(agent, "base_url", None),
+            task=task or "",
+            started_at=started_at,
+            finished_at=finished_at,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            finish_reason=finish_reason,
+            tool_names=tool_names or [],
+            error=error,
+            call_index=getattr(agent, "_telemetry_call_index", None),
+            request_id=getattr(agent, "_telemetry_request_id", None) or None,
+        )
+    except Exception:
+        logger.debug(
+            "api_calls persistence failed (session=%s)", session_id, exc_info=True
+        )
+
+
+def persist_pending_tool_results(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    *,
+    routed_to: str = "main",
+) -> None:
+    """Persist tool-result telemetry for messages not yet recorded."""
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if not session_db or not session_id:
+        return
+    try:
+        from agent.model_metadata import estimate_tokens_rough
+    except Exception:
+        estimate_tokens_rough = lambda text: max(1, len(text or "") // 4)  # noqa: E731
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        if msg.get("_telemetry_recorded"):
+            continue
+        body = _tool_result_text(msg)
+        truncated = bool(msg.get("_aux_large_result_summary")) or any(
+            marker in body for marker in _TELEMETRY_TRUNCATION_MARKERS
+        )
+        deduped = bool(msg.get("_deduped_tool_result")) or body.startswith(
+            _TELEMETRY_DEDUP_MARKER
+        )
+        name = str(msg.get("name") or msg.get("tool_name") or "tool")
+        duration = msg.get("_duration_ms")
+        try:
+            duration_ms = int(duration) if duration is not None else None
+        except (TypeError, ValueError):
+            duration_ms = None
+        try:
+            session_db.record_tool_result(
+                session_id,
+                name,
+                result_chars=len(body),
+                result_est_tokens=estimate_tokens_rough(body) if body else 0,
+                duration_ms=duration_ms,
+                routed_to=routed_to,
+                truncated=truncated,
+                deduped=deduped,
+            )
+            msg["_telemetry_recorded"] = True
+        except Exception:
+            logger.debug(
+                "tool_results persistence failed (session=%s, tool=%s)",
+                session_id,
+                name,
+                exc_info=True,
+            )
+
+
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
@@ -1388,6 +1512,8 @@ def run_conversation(
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
+        agent._telemetry_request_id = None
+        agent._telemetry_call_index = None
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -1468,6 +1594,12 @@ def run_conversation(
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
                 try:
+                    from agent.telemetry_headers import stamp_agent_request_header
+
+                    stamp_agent_request_header(agent, api_kwargs)
+                except Exception:
+                    pass
+                try:
                     from hermes_cli.middleware import apply_llm_request_middleware
 
                     _llm_request_mw = apply_llm_request_middleware(
@@ -1489,6 +1621,13 @@ def run_conversation(
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
+
+                try:
+                    from agent.telemetry_headers import stamp_agent_request_header
+
+                    stamp_agent_request_header(agent, api_kwargs)
+                except Exception:
+                    pass
 
                 try:
                     from hermes_cli.plugins import (
@@ -2537,6 +2676,17 @@ def run_conversation(
                                 if cost_result.status == "included" else None,
                                 model=agent.model,
                                 api_call_count=1,
+                            )
+                            persist_completed_api_call(
+                                agent,
+                                started_at=api_start_time,
+                                finished_at=api_start_time + api_duration,
+                                prompt_tokens=canonical_usage.prompt_tokens,
+                                completion_tokens=canonical_usage.output_tokens,
+                                cached_tokens=canonical_usage.cache_read_tokens,
+                                estimated_prompt_tokens=approx_tokens,
+                                finish_reason=finish_reason,
+                                tool_names=_tool_names_from_response(response),
                             )
                         except Exception as e:
                             # Log token persistence failures so they're
@@ -5324,6 +5474,9 @@ def run_conversation(
                             messages,
                             assistant_message,
                         )
+                        persist_pending_tool_results(
+                            agent, messages, routed_to="main"
+                        )
                         maybe_run_aux_simple_tool_followup(
                             agent,
                             messages,
@@ -5331,6 +5484,9 @@ def run_conversation(
                             effective_task_id,
                             api_call_count,
                             conversation_history=conversation_history,
+                        )
+                        persist_pending_tool_results(
+                            agent, messages, routed_to="aux"
                         )
                     except Exception:
                         logger.warning(
