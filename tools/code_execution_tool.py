@@ -1061,9 +1061,11 @@ def _execute_remote(
             f"HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
             f"PYTHONDONTWRITEBYTECODE=1"
         )
+        from hermes_time import tz_env_value
+
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
         if tz:
-            env_prefix += f" TZ={shlex.quote(tz)}"
+            env_prefix += f" TZ={shlex.quote(tz_env_value(tz))}"
 
         # Execute the script on the remote backend
         logger.info("Executing code on %s backend (task %s)...",
@@ -1377,9 +1379,11 @@ def execute_code(
         # code reflects the correct wall-clock time.  Only TZ is set —
         # HERMES_TIMEZONE is an internal Hermes setting and must not leak
         # into child processes.
+        from hermes_time import tz_env_value
+
         _tz_name = os.getenv("HERMES_TIMEZONE", "").strip()
         if _tz_name:
-            child_env["TZ"] = _tz_name
+            child_env["TZ"] = tz_env_value(_tz_name)
         child_env.pop("HERMES_TIMEZONE", None)
 
         from hermes_constants import apply_subprocess_home_env

@@ -11,13 +11,17 @@ Resolution order:
 
 Invalid timezone values log a warning and fall back safely — Hermes never
 crashes due to a bad timezone string.
+
+Iran abolished DST in 2022. ``Asia/Tehran`` is pinned to IRST (UTC+03:30)
+so stale tzdata cannot apply summer IRDT (UTC+04:30) to ``now()``.
 """
 
 import logging
 import os
-from datetime import datetime
-from hermes_constants import get_config_path
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Optional
+
+from hermes_constants import get_config_path
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +31,13 @@ except ImportError:
     # Python 3.8 fallback (shouldn't be needed — Hermes requires 3.9+)
     from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
 
+# Iran abolished DST in 2022; stale tzdata still applies IRDT (UTC+04:30).
+_IRAN_FIXED = timezone(timedelta(hours=3, minutes=30), name="IRST")
+_IRAN_ZONE_NAMES = frozenset({"Asia/Tehran", "Iran", "IRST", "IRDT"})
+
 # Cached state — resolved once, reused on every call.
 # Call reset_cache() to force re-resolution (e.g. after config changes).
-_cached_tz: Optional[ZoneInfo] = None
+_cached_tz: Optional[tzinfo] = None
 _cached_tz_name: Optional[str] = None
 _cache_resolved: bool = False
 
@@ -79,10 +87,12 @@ def _resolve_timezone_name() -> str:
     return ""
 
 
-def _get_zoneinfo(name: str) -> Optional[ZoneInfo]:
-    """Validate and return a ZoneInfo, or None if invalid."""
+def _get_zoneinfo(name: str) -> Optional[tzinfo]:
+    """Validate and return a tzinfo, or None if invalid."""
     if not name:
         return None
+    if name in _IRAN_ZONE_NAMES:
+        return _IRAN_FIXED
     try:
         return ZoneInfo(name)
     except (KeyError, Exception) as exc:
@@ -93,7 +103,18 @@ def _get_zoneinfo(name: str) -> Optional[ZoneInfo]:
         return None
 
 
-def get_timezone() -> Optional[ZoneInfo]:
+def tz_env_value(name: str) -> str:
+    """POSIX TZ string for subprocesses.
+
+    ``Asia/Tehran`` is pinned to IRST (UTC+03:30, no DST) so child ``date`` /
+    ``datetime.now()`` stay correct on hosts with stale tzdata.
+    """
+    if name in _IRAN_ZONE_NAMES:
+        return "IRST-3:30"
+    return name
+
+
+def get_timezone() -> Optional[tzinfo]:
     """Return the user's configured ZoneInfo, or None (meaning server-local).
 
     Resolved once and cached. Call ``reset_cache()`` after config changes.

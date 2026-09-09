@@ -219,6 +219,41 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
         self.assertIn("TZ='US/Eastern; echo PWNED'", run_cmd,
                       "TZ value must be wrapped in single quotes by shlex.quote()")
 
+    def test_tehran_timezone_uses_fixed_irst_offset(self):
+        """Stale IANA Asia/Tehran still has summer IRDT; pin POSIX TZ to +03:30."""
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+
+            def get_temp_dir(self):
+                return "/tmp"
+
+            def execute(self, command, cwd=None, timeout=None):
+                self.commands.append((command, cwd, timeout))
+                if "command -v python3" in command:
+                    return {"output": "OK\n"}
+                if "python3 script.py" in command:
+                    return {"output": "hello\n", "returncode": 0}
+                return {"output": ""}
+
+        env = FakeEnv()
+        fake_thread = MagicMock()
+
+        with patch("tools.code_execution_tool._load_config",
+                   return_value={"timeout": 30, "max_tool_calls": 5}), \
+             patch("tools.code_execution_tool._get_or_create_env",
+                   return_value=(env, "ssh")), \
+             patch("tools.code_execution_tool._ship_file_to_remote"), \
+             patch("tools.code_execution_tool.threading.Thread",
+                   return_value=fake_thread), \
+             patch.dict(os.environ, {"HERMES_TIMEZONE": "Asia/Tehran"}):
+            result = json.loads(_execute_remote("print('hello')", "task-1", ["terminal"]))
+
+        self.assertEqual(result["status"], "success")
+        run_cmd = next(cmd for cmd, _, _ in env.commands if "python3 script.py" in cmd)
+        self.assertIn("TZ=IRST-3:30", run_cmd)
+        self.assertNotIn("TZ=Asia/Tehran", run_cmd)
+
 
 @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
 class TestExecuteCode(unittest.TestCase):

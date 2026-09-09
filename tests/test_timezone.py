@@ -65,6 +65,12 @@ class TestHermesTimeNow:
         offset_hours = result.utcoffset().total_seconds() / 3600
         assert offset_hours in {-5, -4}
 
+    def test_tehran_is_fixed_0330_without_dst(self):
+        """Iran abolished DST in 2022; stale Asia/Tehran still applies IRDT."""
+        os.environ["HERMES_TIMEZONE"] = "Asia/Tehran"
+        result = hermes_time.now()
+        assert result.utcoffset() == timedelta(hours=3, minutes=30)
+
     def test_invalid_timezone_falls_back(self, caplog):
         """Invalid timezone logs warning and falls back to server-local."""
         os.environ["HERMES_TIMEZONE"] = "Mars/Olympus_Mons"
@@ -128,6 +134,11 @@ class TestGetTimezone:
         os.environ["HERMES_TIMEZONE"] = "Not/A/Timezone"
         tz = hermes_time.get_timezone()
         assert tz is None
+
+    def test_tz_env_value_pins_tehran_to_irst(self):
+        assert hermes_time.tz_env_value("Asia/Tehran") == "IRST-3:30"
+        assert hermes_time.tz_env_value("Iran") == "IRST-3:30"
+        assert hermes_time.tz_env_value("Asia/Kolkata") == "Asia/Kolkata"
 
 
 
