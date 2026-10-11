@@ -3541,7 +3541,9 @@ class SessionDB:
 
         - Strips leading/trailing whitespace
         - Removes ASCII control characters (0x00-0x1F, 0x7F) and problematic
-          Unicode control chars (zero-width, RTL/LTR overrides, etc.)
+          Unicode control chars (zero-width space/joiner, RTL/LTR overrides, etc.)
+        - Keeps U+200C ZERO WIDTH NON-JOINER so Persian titles keep نیم‌فاصله
+          (دسته‌بندی, not دستهبندی)
         - Collapses internal whitespace runs to single spaces
         - Normalizes empty/whitespace-only strings to None
         - Enforces MAX_TITLE_LENGTH
@@ -3562,11 +3564,14 @@ class SessionDB:
         cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', title)
 
         # Remove problematic Unicode control characters:
-        # - Zero-width chars (U+200B-U+200F, U+FEFF)
-        # - Directional overrides (U+202A-U+202E, U+2066-U+2069)
+        # - Zero-width space (U+200B) and joiner (U+200D); keep non-joiner
+        #   (U+200C), which is required Persian orthography
+        # - Bidi marks (U+200E-U+200F) and directional overrides
+        #   (U+202A-U+202E, U+2066-U+2069)
+        # - Word joiner / invisible operators (U+2060-U+2064), BOM (U+FEFF)
         # - Object replacement (U+FFFC), interlinear annotation (U+FFF9-U+FFFB)
         cleaned = re.sub(
-            r'[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]',
+            r'[\u200b\u200d-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]',
             '', cleaned,
         )
 

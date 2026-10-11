@@ -3361,6 +3361,11 @@ class TestSanitizeTitle:
         assert SessionDB.sanitize_title("hello\u200bworld") == "helloworld"
         assert SessionDB.sanitize_title("hello\u200dworld") == "helloworld"
 
+    def test_persian_zwnj_is_preserved(self):
+        # U+200C is نیم‌فاصله, not an invisible spoofing char.
+        assert SessionDB.sanitize_title("دسته‌بندی") == "دسته‌بندی"
+        assert "\u200c" in SessionDB.sanitize_title("دسته\u200cبندی")
+
     def test_rtl_override_stripped(self):
         # Right-to-left override (U+202E) — used in filename spoofing attacks
         assert SessionDB.sanitize_title("hello\u202eworld") == "helloworld"
